@@ -85,6 +85,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.lerobot_features = None
         self.actions_per_chunk = None
         self.policy = None
+        # Identifies the checkpoint currently resident in memory, so a reconnecting
+        # client asking for the same one does not pay the load cost again. Deliberately
+        # NOT cleared by _reset_server: surviving a client reconnect is the whole point.
+        self._loaded_policy_key = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
 
@@ -101,6 +105,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # only running inference on the latest observation received by the server
         self.shutdown_event.set()
         self.observation_queue = Queue(maxsize=1)
+        # Belongs to the departed client: leaving it set means the next client's first
+        # observation gets similarity-checked against a stale one from the last run.
+        self.last_processed_obs = None
 
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
@@ -112,6 +119,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.shutdown_event.clear()
 
         return services_pb2.Empty()
+
+    @staticmethod
+    def _policy_cache_key(policy_specs: RemotePolicyConfig) -> tuple:
+        """Everything that is baked into the loaded policy and its processors.
+
+        `lerobot_features` and `actions_per_chunk` are deliberately excluded: both are
+        read per-request during inference, so a client may change them without needing
+        a reload. `rename_map` and `device` are included because they are compiled into
+        the pre/post-processor pipelines at load time.
+        """
+        return (
+            policy_specs.policy_type,
+            str(policy_specs.pretrained_name_or_path),
+            str(policy_specs.device),
+            tuple(sorted((policy_specs.rename_map or {}).items())),
+        )
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
         """Receive policy instructions from the robot client"""
@@ -141,12 +164,32 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Device: {policy_specs.device}"
         )
 
+        # Refreshed unconditionally: these are consulted per-request at inference time,
+        # so they must track the current client even when the policy itself is reused.
         self.device = policy_specs.device
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
+        cache_key = self._policy_cache_key(policy_specs)
+        if self.policy is not None and cache_key == self._loaded_policy_key:
+            # Restarting the client against an unchanged checkpoint is the common
+            # development loop, and reloading a VLA-sized checkpoint costs minutes.
+            # reset() drops per-episode state (action queues, memory buffers) so the
+            # reused policy behaves identically to a freshly loaded one.
+            self.policy.reset()
+            self.logger.info(
+                f"Reusing policy already resident on {self.device} "
+                f"({policy_specs.pretrained_name_or_path}) - skipping reload"
+            )
+            return services_pb2.Empty()
+
         policy_class = get_policy_class(self.policy_type)
+
+        # Invalidated before the load, not after: if loading raises partway through,
+        # a null key forces the next client to reload rather than inherit a policy
+        # that is half-paired with the previous checkpoint's processors.
+        self._loaded_policy_key = None
 
         start = time.perf_counter()
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
@@ -166,6 +209,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         end = time.perf_counter()
 
+        self._loaded_policy_key = cache_key
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
