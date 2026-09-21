@@ -166,6 +166,19 @@ class RobotClientConfig:
         metadata={"help": "Keyboard backend: terminal (focused window only) | auto"},
     )
 
+    # --- Live display -----------------------------------------------------------------
+    # An OpenCV window with the camera feed and rollout status. It is also a second
+    # key source, so the controls work whether the window or the terminal has focus.
+    display: bool = field(default=False, metadata={"help": "Show the camera + status window"})
+    display_camera: str = field(
+        default="", metadata={"help": "Which camera to show (default: the first one)"}
+    )
+    display_fps: float = field(
+        default=15.0,
+        metadata={"help": "Window refresh rate. Below the control rate on purpose - drawing costs time"},
+    )
+    display_scale: float = field(default=1.0, metadata={"help": "Scale factor applied to the camera image"})
+
     # --- Episodic recording -----------------------------------------------------------
     # Each start->stop span is one episode. Unset `record_root` to run without recording.
     record_root: str | None = field(
@@ -259,6 +272,12 @@ class RobotClientConfig:
 
         if self.move_duration_s <= 0:
             raise ValueError(f"move_duration_s must be positive, got {self.move_duration_s}")
+
+        if self.display_fps <= 0:
+            raise ValueError(f"display_fps must be positive, got {self.display_fps}")
+
+        if self.display_scale <= 0:
+            raise ValueError(f"display_scale must be positive, got {self.display_scale}")
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "RobotClientConfig":

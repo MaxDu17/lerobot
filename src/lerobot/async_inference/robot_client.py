@@ -72,6 +72,7 @@ import random
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
@@ -144,6 +145,7 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+from .rollout_display import RolloutDisplay, RolloutStatus
 
 
 def smooth_move_to(
@@ -275,6 +277,15 @@ class RobotClient:
         self.dataset_features: dict[str, dict] | None = None
         self._home_poses: dict[int, dict[str, float]] | None = None
 
+        self.display: RolloutDisplay | None = None
+        self._display_camera = ""
+        # Short note shown in the status panel, so the window alone tells you what the
+        # last action was without watching the log.
+        self._message = ""
+        # Timestamps of recent control ticks, for the measured loop rate. Bounded, so
+        # the rate reflects the last second rather than the whole session.
+        self._tick_times: deque[float] = deque(maxlen=60)
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -336,6 +347,9 @@ class RobotClient:
                 f"Loaded {len(self._home_poses)} episode start poses from {self.config.home_dataset}"
             )
 
+        if self.config.display:
+            self._setup_display()
+
         if self.config.interactive:
             self.listener = self._make_listener()
             self.logger.info(
@@ -345,6 +359,88 @@ class RobotClient:
             # load the checkpoint, which takes minutes for a VLA. Keys pressed meanwhile
             # queue up and fire once the control loop starts, which looks like a hang.
             self.logger.info("Waiting for the server to load the policy before accepting commands...")
+
+    def _setup_display(self) -> None:
+        cameras = list(getattr(self.robot, "cameras", {}) or {})
+        if not cameras:
+            self.logger.warning("display=True but the robot has no cameras - showing status only.")
+
+        requested = self.config.display_camera
+        if requested and requested not in cameras:
+            raise ValueError(f"display_camera={requested!r} is not one of the robot's cameras: {cameras}")
+        self._display_camera = requested or (cameras[0] if cameras else "")
+
+        self.display = RolloutDisplay(
+            window_name=f"LeRobot rollout - {self._display_camera or 'no camera'}",
+            refresh_hz=self.config.display_fps,
+            scale=self.config.display_scale,
+            controls_help=self.CONTROLS_HELP,
+        )
+        self.logger.info(
+            f"Display window open (camera '{self._display_camera}'). "
+            "Keys work with either the window or the terminal focused."
+        )
+
+    def _status(self) -> RolloutStatus:
+        """Snapshot of what the panel shows. Add fields here as the panel grows."""
+        running = self.run_event.is_set()
+        with self.action_queue_lock:
+            queue = self.action_queue.qsize()
+
+        frames = 0
+        episodes = 0
+        if self.dataset is not None:
+            episodes = self.dataset.num_episodes
+            buffer = getattr(self.dataset.writer, "episode_buffer", None)
+            frames = buffer.get("size", 0) if buffer else 0
+
+        return RolloutStatus(
+            state="RUNNING" if running else "IDLE",
+            running=running,
+            recording=running and self.dataset is not None,
+            episodes=episodes,
+            frames=frames,
+            queue=queue,
+            chunk=max(self.action_chunk_size, 0),
+            fps=self._measured_fps(),
+            target_fps=self.config.fps,
+            task=self.config.task,
+            message=self._message,
+        )
+
+    def _measured_fps(self) -> float:
+        """Control-loop rate over the last few ticks, not a session average."""
+        if len(self._tick_times) < 2:
+            return 0.0
+        span = self._tick_times[-1] - self._tick_times[0]
+        return (len(self._tick_times) - 1) / span if span > 1e-6 else 0.0
+
+    def _service_display(self, observation: RawObservation | None) -> RawObservation | None:
+        """Redraw if due, and route any window keypress into the same command queue.
+
+        Returns the observation it used, which may have been captured here: while idle
+        the control loop takes no observations at all, but the feed still has to be
+        live so the operator can see the scene they are resetting.
+        """
+        if self.display is None or not self.display.due():
+            return observation
+
+        if self.display.closed:
+            self.logger.info("Display window closed - continuing without it.")
+            self.display = None
+            return observation
+
+        if observation is None:
+            observation = self.robot.get_observation()
+
+        frame = observation.get(self._display_camera) if self._display_camera else None
+        self.display.update(frame, self._status())
+
+        key = self.display.poll_key()
+        if key is not None and self.config.interactive:
+            self._on_key(key)
+
+        return observation
 
     def _make_listener(self):
         """Start the configured keyboard backend.
@@ -479,6 +575,7 @@ class RobotClient:
         # all until they return -- and if the server predates the resident-policy cache
         # it reloads the checkpoint here, which is minutes of total silence that looks
         # exactly like a dead keyboard.
+        self._message = "Handshaking..."
         self.logger.info("Starting policy - handshaking with the server...")
 
         handshake_start = time.perf_counter()
@@ -505,6 +602,7 @@ class RobotClient:
             )
 
         self.run_event.set()
+        self._message = "Recording episode"
         self.logger.info("Policy RUNNING - press 's' to stop and save.")
 
     def _stop_policy(self, save: bool = True) -> None:
@@ -516,21 +614,25 @@ class RobotClient:
         # deliberately do not call robot.disconnect(), which would cut torque and drop it.
         self.run_event.clear()
         self._drain_action_queue()
+        self._message = "Stopped - holding position"
         self.logger.info("Policy STOPPED - arm holding position.")
 
         if self.dataset is None:
             return
 
         if not self.dataset.has_pending_frames():
+            self._message = "Stopped - nothing recorded"
             self.logger.info("No frames recorded - nothing to save.")
             return
 
         if save:
             self.logger.info("Saving episode (encoding, this blocks for a moment)...")
             self.dataset.save_episode()
+            self._message = f"Saved episode {self.dataset.num_episodes - 1}"
             self.logger.info(f"Saved. Dataset now holds {self.dataset.num_episodes} episodes.")
         else:
             self.dataset.clear_episode_buffer()
+            self._message = "Discarded episode"
             self.logger.info("Discarded episode.")
 
     def _drain_action_queue(self) -> None:
@@ -580,6 +682,7 @@ class RobotClient:
 
     def _move_to_pose(self, which: str) -> None:
         if self.run_event.is_set():
+            self._message = f"Press 's' before '{which[0]}'"
             self.logger.warning(f"Refusing '{which[0]}' while the policy is running - press 's' first.")
             return
 
@@ -597,6 +700,7 @@ class RobotClient:
 
         self.logger.info(f"Moving to {which} pose over {self.config.move_duration_s:.1f}s...")
         smooth_move_to(self.robot, current, target, self.config.move_duration_s, self.config.fps)
+        self._message = f"At {which} pose"
         self.logger.info(f"At {which} pose.")
 
     def _record_frame(self, observation: RawObservation, action: dict[str, Any], task: str) -> None:
@@ -921,12 +1025,19 @@ class RobotClient:
 
         while self.running:
             control_loop_start = time.perf_counter()
+            self._tick_times.append(control_loop_start)
 
             # May block for seconds on a rest/home move, but only ever while idle.
             self._handle_commands()
 
+            tick_observation = None
             if self.run_event.is_set():
                 _captured_observation, _performed_action = self.control_loop_tick(task, verbose)
+                tick_observation = _captured_observation
+
+            # Reuses the tick's observation when running, and captures its own at the
+            # (slower) refresh rate when idle, so the feed stays live between episodes.
+            self._service_display(tick_observation)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
@@ -1010,6 +1121,9 @@ def async_client(cfg: RobotClientConfig):
         finally:
             if client.listener is not None:
                 client.listener.stop()
+
+            if client.display is not None:
+                client.display.close()
 
             client.stop()
             action_receiver_thread.join()
