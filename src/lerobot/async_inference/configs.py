@@ -148,6 +148,56 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
+    # --- Interactive keyboard control -------------------------------------------------
+    # Opt-in: with `interactive=False` the client runs the policy from startup to Ctrl+C,
+    # which is the historical behavior.
+    interactive: bool = field(
+        default=False,
+        metadata={"help": "Drive start/stop/rest/home from the keyboard (c/s/r/h/q)"},
+    )
+
+    # --- Episodic recording -----------------------------------------------------------
+    # Each start->stop span is one episode. Unset `record_root` to run without recording.
+    record_root: str | None = field(
+        default=None, metadata={"help": "Directory to write the rollout dataset to (unset = no recording)"}
+    )
+    record_repo_id: str = field(
+        default="", metadata={"help": "repo_id for the rollout dataset (required when record_root is set)"}
+    )
+    record_video: bool = field(
+        default=True, metadata={"help": "Encode camera streams as video rather than individual images"}
+    )
+    num_image_writer_threads: int = field(
+        default=4, metadata={"help": "Image-writer threads per camera while recording"}
+    )
+
+    # --- Rest / home poses ------------------------------------------------------------
+    # Joint targets in the robot's own action space, e.g. {shoulder_pan.pos: 0.0, ...}.
+    # Body joints are normalized to [-100, 100] and the gripper to [0, 100], the same
+    # units a recorded dataset's `observation.state` uses.
+    rest_pose: dict[str, float] = field(
+        default_factory=dict,
+        metadata={"help": "Folded rest pose for the 'r' key. Capture one with tools/capture_pose.py"},
+    )
+    home_source: str = field(
+        default="none",
+        metadata={"help": "Where the 'h' pose comes from: none | manual | dataset"},
+    )
+    home_pose: dict[str, float] = field(
+        default_factory=dict, metadata={"help": "Explicit home pose, used when home_source=manual"}
+    )
+    home_dataset: str | None = field(
+        default=None,
+        metadata={"help": "Dataset root to sample episode start poses from (home_source=dataset)"},
+    )
+    home_episode: int | None = field(
+        default=None,
+        metadata={"help": "Pin the sampled home pose to this episode index (default: sample at random)"},
+    )
+    move_duration_s: float = field(
+        default=3.0, metadata={"help": "Seconds to interpolate a rest/home move over"}
+    )
+
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
@@ -180,6 +230,22 @@ class RobotClientConfig:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
+
+        if self.home_source not in ("none", "manual", "dataset"):
+            raise ValueError(f"home_source must be one of none/manual/dataset, got {self.home_source!r}")
+
+        # Fail at parse time rather than on the first 'h' press, when the arm is live.
+        if self.home_source == "manual" and not self.home_pose:
+            raise ValueError("home_source=manual requires --home_pose")
+
+        if self.home_source == "dataset" and not self.home_dataset:
+            raise ValueError("home_source=dataset requires --home_dataset")
+
+        if self.record_root and not self.record_repo_id:
+            raise ValueError("record_root requires --record_repo_id")
+
+        if self.move_duration_s <= 0:
+            raise ValueError(f"move_duration_s must be positive, got {self.move_duration_s}")
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "RobotClientConfig":
