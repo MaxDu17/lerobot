@@ -47,6 +47,13 @@ Stopping does not disconnect the robot: torque stays on and the arm holds positi
 startup; `c` then re-handshakes against the server's resident-policy cache, which is
 near-instant and resets per-episode policy state.
 
+Keys are read straight from the controlling TTY, so the terminal must be focused and
+keystrokes are not echoed while the client runs. `--keyboard_backend=auto` switches to
+pynput's global hook instead, which also fires when the terminal is in the background;
+it needs macOS Accessibility permission and does not work reliably inside an Electron
+host such as VS Code's integrated terminal. If the process is killed hard enough to
+skip cleanup, `stty sane` restores the terminal.
+
 ```shell
 python src/lerobot/async_inference/robot_client.py \
     ... \
@@ -62,6 +69,7 @@ import json
 import logging
 import pickle  # nosec
 import random
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -112,7 +120,7 @@ from lerobot.utils.import_utils import (
     register_third_party_plugins,
     require_package,
 )
-from lerobot.utils.keyboard_input import create_key_listener
+from lerobot.utils.keyboard_input import TerminalKeyListener, create_key_listener
 
 # Recording and dataset-sampled home poses live behind the `dataset` extra. The client
 # itself does not need it: without these the policy still runs, only --record_root and
@@ -329,17 +337,53 @@ class RobotClient:
             )
 
         if self.config.interactive:
-            self.listener = create_key_listener(self._on_key, controls_help=self.CONTROLS_HELP)
-            if self.listener is None:
-                raise RuntimeError(
-                    "interactive=True but no keyboard backend is available (not a TTY, and pynput "
-                    "cannot capture). Run from an interactive terminal, or use interactive=False."
-                )
-            self.logger.info(f"Interactive mode. Controls: {self.CONTROLS_HELP}")
+            self.listener = self._make_listener()
+            self.logger.info(
+                f"Interactive mode ({self.config.keyboard_backend} keyboard). Controls: {self.CONTROLS_HELP}"
+            )
             # Deliberately not "press c" yet: the initial handshake below still has to
             # load the checkpoint, which takes minutes for a VLA. Keys pressed meanwhile
             # queue up and fire once the control loop starts, which looks like a hang.
             self.logger.info("Waiting for the server to load the policy before accepting commands...")
+
+    def _make_listener(self):
+        """Start the configured keyboard backend.
+
+        `create_key_listener`'s auto-selection prefers pynput's global hook and only
+        falls back to the TTY when macOS reports the process as untrusted. That check
+        is best-effort: it asks whether Accessibility is granted, not whether the event
+        tap actually delivers anything. Inside an Electron host like VS Code's
+        integrated terminal the two disagree -- TCC attributes the tap to a helper
+        binary that was never granted, so the trust probe passes, pynput wins the
+        selection, and no key ever arrives. The fallback never engages because nothing
+        reported failure.
+
+        Reading the controlling TTY has no such ambiguity, which is why it is the
+        default here. It also scopes the controls to the focused window: with the
+        global hook, a stray 'c' typed into a browser would start the arm.
+        """
+        if self.config.keyboard_backend == "auto":
+            listener = create_key_listener(self._on_key, controls_help=self.CONTROLS_HELP)
+            if listener is None:
+                raise RuntimeError(
+                    "interactive=True but no keyboard backend is available (not a TTY, and "
+                    "pynput cannot capture). Run from an interactive terminal, or use "
+                    "interactive=False."
+                )
+            return listener
+
+        if not sys.stdin.isatty():
+            # TerminalKeyListener.start() is a silent no-op in this case, which would
+            # leave the session with a listener object that never fires.
+            raise RuntimeError(
+                "keyboard_backend=terminal needs stdin to be an interactive terminal, but it "
+                "is redirected or piped. Launch the script directly rather than through a "
+                "pipeline, or use --interactive=false."
+            )
+
+        listener = TerminalKeyListener(self._on_key)
+        listener.start()
+        return listener
 
     def _setup_dataset(self) -> None:
         require_package("datasets", "dataset")
@@ -430,6 +474,14 @@ class RobotClient:
 
         self._reset_episode_state()
 
+        # Acknowledge the keypress BEFORE the handshake. Both calls below are blocking
+        # and run on the control-loop thread, so without this 'c' produces no output at
+        # all until they return -- and if the server predates the resident-policy cache
+        # it reloads the checkpoint here, which is minutes of total silence that looks
+        # exactly like a dead keyboard.
+        self.logger.info("Starting policy - handshaking with the server...")
+
+        handshake_start = time.perf_counter()
         try:
             # Ready() flushes the server's observation queue, its predicted-timestep set
             # and its last processed observation. SendPolicyInstructions() then hits the
@@ -441,6 +493,16 @@ class RobotClient:
         except grpc.RpcError as e:
             self.logger.error(f"Could not start policy - server handshake failed: {e}")
             return
+
+        handshake_s = time.perf_counter() - handshake_start
+        if handshake_s > 10:
+            # A cache hit is milliseconds. Anything this slow means the server reloaded
+            # the checkpoint, i.e. it is running a build without the reuse-on-reconnect
+            # support -- every 'c' will cost this much until the server is updated.
+            self.logger.warning(
+                f"Handshake took {handshake_s:.0f}s - the server reloaded the checkpoint "
+                "instead of reusing the resident one. Update and restart the policy server."
+            )
 
         self.run_event.set()
         self.logger.info("Policy RUNNING - press 's' to stop and save.")

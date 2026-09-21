@@ -156,6 +156,16 @@ class RobotClientConfig:
         metadata={"help": "Drive start/stop/rest/home from the keyboard (c/s/r/h/q)"},
     )
 
+    # "terminal" reads the controlling TTY directly and requires the window to be
+    # focused. "auto" prefers pynput's global hook, which also fires when the terminal
+    # is in the background -- convenient, but it means a stray 'c' in any application
+    # starts the arm, and on macOS it can silently capture nothing when the process is
+    # hosted by an app TCC attributes differently (VS Code's integrated terminal).
+    keyboard_backend: str = field(
+        default="terminal",
+        metadata={"help": "Keyboard backend: terminal (focused window only) | auto"},
+    )
+
     # --- Episodic recording -----------------------------------------------------------
     # Each start->stop span is one episode. Unset `record_root` to run without recording.
     record_root: str | None = field(
@@ -230,6 +240,9 @@ class RobotClientConfig:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
+
+        if self.keyboard_backend not in ("terminal", "auto"):
+            raise ValueError(f"keyboard_backend must be terminal or auto, got {self.keyboard_backend!r}")
 
         if self.home_source not in ("none", "manual", "dataset"):
             raise ValueError(f"home_source must be one of none/manual/dataset, got {self.home_source!r}")
