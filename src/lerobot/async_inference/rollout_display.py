@@ -12,47 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Live camera + status window for interactive policy rollouts.
+"""Live camera + status window for interactive policy rollouts, built on PyQt5.
 
-Kept deliberately small and declarative so it can grow:
+Extending it:
 
-* to show a new value, add a field to :class:`RolloutStatus` and one entry to
-  :data:`PANEL_ROWS` (or append to ``display.extra_rows`` from the caller, which
-  needs no edit to this file);
-* to draw on the camera image itself, append to ``display.overlays``.
+* a new status value -> add a field to :class:`RolloutStatus`, populate it in
+  ``RobotClient._status()``, and add one entry to :data:`PANEL_ROWS`;
+* a row the caller owns -> append to ``window.extra_rows``; no edit here;
+* a new camera -> nothing, the window builds one tile per key it is given;
+* a new control -> add a button in :meth:`RolloutWindow._build_controls`, which
+  routes through the same ``on_command`` callback the keyboard uses.
 
-Everything renders with OpenCV drawing primitives into a single canvas, so there is
-no GUI toolkit or event loop to reason about beyond ``cv2.waitKey``.
-
-Threading: ``cv2.imshow`` must be called from the main thread on macOS, which is
-where ``RobotClient.control_loop`` already runs. Do not move rendering onto the
-action-receiver thread.
+Threading. Qt owns the main thread and the control loop runs on a worker, which is
+the inverse of the usual lerobot arrangement but the only way Qt works: widgets may
+only be touched from the thread that created them. The worker therefore never calls
+into the window directly -- it emits :class:`DisplayBridge.updated`, and Qt marshals
+the payload onto the GUI thread. The frames handed over must not be mutated
+afterwards; the client passes freshly captured arrays, which satisfies that.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-import cv2  # type: ignore  # TODO: add type stubs for OpenCV
 import numpy as np
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtGui import QFont, QImage, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 logger = logging.getLogger(__name__)
 
-# BGR, because the canvas is handed straight to cv2.imshow.
-_BG = (28, 28, 30)
-_TEXT = (225, 225, 225)
-_DIM = (145, 145, 145)
-_RUNNING = (120, 215, 110)
-_IDLE = (70, 180, 245)
-_REC = (70, 70, 240)
-_RULE = (60, 60, 64)
+_BG = "#1c1c1e"
+_PANEL = "#242428"
+_TEXT = "#e1e1e1"
+_DIM = "#8e8e93"
+_RUNNING = "#5ed46e"
+_IDLE = "#f5a623"
+_REC = "#ff453a"
 
-PANEL_W = 300
-FOOTER_H = 34
-_PAD = 16
+PANEL_W = 260
 
 
 @dataclass
@@ -70,6 +80,8 @@ class RolloutStatus:
     target_fps: float = 30.0
     task: str = ""
     message: str = ""
+    # Cameras the policy actually consumes, so the tiles can say which is which.
+    policy_cameras: list[str] = field(default_factory=list)
 
 
 # (label, value-formatter). Add a tuple to add a row; nothing else needs to change.
@@ -80,176 +92,237 @@ PANEL_ROWS: list[tuple[str, Callable[[RolloutStatus], str]]] = [
     ("Loop Hz", lambda s: f"{s.fps:.1f} / {s.target_fps:.0f}"),
 ]
 
+# Buttons rendered under the panel, as (label, command). Commands are the same
+# strings the keyboard produces, so both paths converge on one handler.
+CONTROL_BUTTONS: list[tuple[str, str]] = [
+    ("Start  (c)", "start"),
+    ("Stop + save  (s)", "stop"),
+    ("Discard  (d)", "discard"),
+    ("Rest  (r)", "rest"),
+    ("Home  (h)", "home"),
+]
 
-def _put(canvas, text: str, org: tuple[int, int], scale: float, color, thickness: int = 1) -> None:
-    cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+_KEY_TO_COMMAND = {
+    Qt.Key_C: "start",
+    Qt.Key_S: "stop",
+    Qt.Key_D: "discard",
+    Qt.Key_R: "rest",
+    Qt.Key_H: "home",
+    Qt.Key_Q: "quit",
+    Qt.Key_Escape: "quit",
+}
 
 
-def _text_w(text: str, scale: float) -> int:
-    return cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0]
+class DisplayBridge(QObject):
+    """Thread-safe conduit from the control loop to the window.
 
-
-def _wrap(text: str, max_px: int, scale: float, max_lines: int) -> list[str]:
-    """Greedy word wrap to a pixel width, ellipsising anything past `max_lines`.
-
-    Measured rather than counted in characters, so the panel stays correct if PANEL_W
-    or the font scale changes.
+    A queued signal is the supported way to cross into the GUI thread; calling the
+    widget directly from the worker is undefined behaviour that usually presents as a
+    crash under load rather than an exception.
     """
-    if not text:
-        return []
 
-    words = text.split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        if _text_w(candidate, scale) <= max_px:
-            current = candidate
-            continue
-        if current:
-            lines.append(current)
-        current = word
-        if len(lines) == max_lines:
-            current = ""
-            break
-    if current and len(lines) < max_lines:
-        lines.append(current)
-
-    if lines and sum(len(line.split()) for line in lines) < len(words):
-        # Trim the tail until the ellipsis itself fits.
-        last = lines[-1]
-        while last and _text_w(last + "...", scale) > max_px:
-            last = last[:-1]
-        lines[-1] = last + "..."
-    return lines
+    updated = pyqtSignal(object, object)  # frames: dict[str, np.ndarray], RolloutStatus
+    closed = pyqtSignal()
 
 
-class RolloutDisplay:
-    """A camera feed with a status panel, refreshed at a fraction of the control rate.
+def _numpy_to_pixmap(frame: np.ndarray, width: int) -> QPixmap:
+    """RGB uint8 array -> QPixmap scaled to `width`."""
+    height, original_width = frame.shape[:2]
+    # QImage does not copy, and the array may be reused by the caller, so copy here.
+    image = QImage(
+        np.ascontiguousarray(frame).data, original_width, height, 3 * original_width, QImage.Format_RGB888
+    ).copy()
+    return QPixmap.fromImage(image).scaledToWidth(width, Qt.SmoothTransformation)
 
-    The control loop runs at 30 Hz but the window does not need to: rendering and
-    ``cv2.waitKey`` cost a millisecond or two each, which is real budget inside a
-    33 ms tick. :meth:`due` lets the caller skip most ticks.
-    """
+
+class CameraTile(QWidget):
+    """One camera feed with a caption."""
+
+    def __init__(self, name: str, width: int, policy_input: bool) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        suffix = "  •  policy input" if policy_input else "  •  recorded only"
+        caption = QLabel(name + suffix)
+        caption.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
+
+        self.view = QLabel()
+        self.view.setFixedWidth(width)
+        self.view.setMinimumHeight(int(width * 9 / 16))
+        self.view.setAlignment(Qt.AlignCenter)
+        self.view.setStyleSheet(f"background: #000; border: 1px solid {_PANEL};")
+        self.view.setText("waiting for frames…")
+
+        layout.addWidget(caption)
+        layout.addWidget(self.view)
+        self._width = width
+
+    def set_frame(self, frame: np.ndarray | None) -> None:
+        if frame is None:
+            return
+        self.view.setPixmap(_numpy_to_pixmap(frame, self._width))
+
+
+class RolloutWindow(QMainWindow):
+    """Camera tiles on the left, status panel and controls on the right."""
 
     def __init__(
         self,
-        window_name: str = "LeRobot rollout",
-        refresh_hz: float = 15.0,
-        scale: float = 1.0,
-        controls_help: str = "",
+        camera_names: list[str],
+        policy_cameras: list[str],
+        on_command: Callable[[str], None],
+        tile_width: int = 480,
+        columns: int = 2,
     ) -> None:
-        self.window_name = window_name
-        self.scale = scale
-        self.controls_help = controls_help
-        self._period = 1.0 / refresh_hz if refresh_hz > 0 else 0.0
-        self._last_draw = 0.0
-        self._closed = False
-
-        # Extension seams: callers can add rows or draw on the frame without editing
-        # this module. `overlays` receive the (already BGR, already scaled) frame.
+        super().__init__()
+        self.setWindowTitle("LeRobot rollout")
+        self._on_command = on_command
         self.extra_rows: list[tuple[str, Callable[[RolloutStatus], str]]] = []
-        self.overlays: list[Callable[[np.ndarray, RolloutStatus], None]] = []
 
-        cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+        central = QWidget()
+        central.setStyleSheet(f"background: {_BG};")
+        root = QHBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
 
-    @property
-    def closed(self) -> bool:
-        """True once the user has closed the window (or it failed to open)."""
-        if self._closed:
-            return True
+        # One tile per camera, wrapping into `columns`, so adding a third camera needs
+        # no layout change here.
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        self.tiles: dict[str, CameraTile] = {}
+        for i, name in enumerate(camera_names):
+            tile = CameraTile(name, tile_width, policy_input=name in policy_cameras)
+            self.tiles[name] = tile
+            # Top-aligned, otherwise the grid spreads each tile over the full row
+            # height and the caption ends up floating far above its image.
+            grid.addWidget(tile, i // columns, i % columns, Qt.AlignTop | Qt.AlignLeft)
+        if not camera_names:
+            grid.addWidget(QLabel("no cameras configured"), 0, 0)
+        # Soak up leftover vertical space below the last row of tiles.
+        grid.setRowStretch(grid.rowCount(), 1)
+
+        root.addLayout(grid)
+        root.addWidget(self._build_panel())
+        self.setCentralWidget(central)
+
+        # Keystrokes must reach keyPressEvent even when a button has been clicked,
+        # which would otherwise take focus and swallow them.
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    # ---------------------------------------------------------------- construction --
+
+    def _build_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setFixedWidth(PANEL_W)
+        panel.setStyleSheet(f"background: {_PANEL}; border-radius: 6px;")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.state_label = QLabel("IDLE")
+        state_font = QFont()
+        state_font.setPointSize(20)
+        state_font.setBold(True)
+        self.state_label.setFont(state_font)
+
+        self.rec_label = QLabel("")
+        self.rec_label.setStyleSheet(f"color: {_REC}; font-size: 12px; font-weight: bold;")
+
+        header = QHBoxLayout()
+        header.addWidget(self.state_label)
+        header.addStretch(1)
+        header.addWidget(self.rec_label)
+        layout.addLayout(header)
+        layout.addWidget(self._rule())
+
+        # Rows are rebuilt on demand rather than cached, so extra_rows added after
+        # construction still show up.
+        self.rows_container = QVBoxLayout()
+        self.rows_container.setSpacing(6)
+        self._row_labels: dict[str, QLabel] = {}
+        layout.addLayout(self.rows_container)
+
+        layout.addWidget(self._rule())
+
+        task_caption = QLabel("TASK")
+        task_caption.setStyleSheet(f"color: {_DIM}; font-size: 10px; letter-spacing: 1px;")
+        self.task_label = QLabel("")
+        self.task_label.setWordWrap(True)
+        self.task_label.setStyleSheet(f"color: {_TEXT}; font-size: 12px;")
+        layout.addWidget(task_caption)
+        layout.addWidget(self.task_label)
+
+        layout.addStretch(1)
+        layout.addWidget(self._build_controls())
+
+        self.message_label = QLabel("")
+        self.message_label.setWordWrap(True)
+        self.message_label.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
+        layout.addWidget(self.message_label)
+
+        return panel
+
+    def _build_controls(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        for label, command in CONTROL_BUTTONS:
+            button = QPushButton(label)
+            button.setStyleSheet(
+                f"QPushButton {{ background: #32323a; color: {_TEXT}; border: none;"
+                f" padding: 6px; border-radius: 4px; font-size: 11px; }}"
+                f"QPushButton:hover {{ background: #3e3e48; }}"
+            )
+            # Buttons emit the same commands as the keys, so there is one code path.
+            button.clicked.connect(lambda _, c=command: self._dispatch(c))
+            # Otherwise the button keeps focus and the next keystroke re-triggers it.
+            button.setFocusPolicy(Qt.NoFocus)
+            layout.addWidget(button)
+        return box
+
+    @staticmethod
+    def _rule() -> QFrame:
+        rule = QFrame()
+        rule.setFrameShape(QFrame.HLine)
+        rule.setStyleSheet("color: #3a3a40;")
+        return rule
+
+    # -------------------------------------------------------------------- behaviour --
+
+    def _dispatch(self, command: str) -> None:
         try:
-            # < 1 means destroyed; a backend without window properties raises instead.
-            self._closed = cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1
-        except cv2.error:
-            self._closed = True
-        return self._closed
+            self._on_command(command)
+        except Exception:
+            logger.exception("Command %r from the window failed", command)
 
-    def due(self) -> bool:
-        """Whether enough time has passed to be worth redrawing."""
-        return (time.perf_counter() - self._last_draw) >= self._period
-
-    def update(self, frame: np.ndarray | None, status: RolloutStatus) -> None:
-        """Draw one frame. `frame` is an RGB camera image, or None for a placeholder."""
-        if self.closed:
-            return
-
-        self._last_draw = time.perf_counter()
-        canvas = self._compose(frame, status)
-        try:
-            cv2.imshow(self.window_name, canvas)
-        except cv2.error as e:
-            logger.warning("Display update failed, disabling window: %s", e)
-            self._closed = True
-
-    def poll_key(self) -> str | None:
-        """Pump the GUI event loop and return a pressed key name, if any.
-
-        Must be called regularly or the window will not repaint. Returns the same
-        canonical names the keyboard listeners emit, so the caller can feed it
-        straight into the same handler.
-        """
-        if self._closed:
-            return None
-        try:
-            code = cv2.waitKey(1)
-        except cv2.error:
-            self._closed = True
-            return None
-        if code == -1:
-            return None
-        if code == 27:
-            return "esc"
-        char = chr(code & 0xFF)
-        return char if char.isprintable() else None
-
-    def close(self) -> None:
-        self._closed = True
-        try:
-            cv2.destroyWindow(self.window_name)
-            # destroyWindow only queues the teardown; waitKey lets the backend run it.
-            cv2.waitKey(1)
-        except cv2.error:
-            pass
-
-    # ------------------------------------------------------------------ rendering --
-
-    def _compose(self, frame: np.ndarray | None, status: RolloutStatus) -> np.ndarray:
-        if frame is None:
-            view = np.full((360, 640, 3), 40, dtype=np.uint8)
-            _put(view, "no camera frame", (200, 185), 0.6, _DIM)
+    def keyPressEvent(self, event) -> None:  # noqa: N802  (Qt naming)
+        command = _KEY_TO_COMMAND.get(event.key())
+        if command is not None:
+            self._dispatch(command)
         else:
-            # Cameras hand back RGB; cv2.imshow wants BGR.
-            view = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            if self.scale != 1.0:
-                view = cv2.resize(view, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
+            super().keyPressEvent(event)
 
-        for overlay in self.overlays:
-            overlay(view, status)
+    def closeEvent(self, event) -> None:  # noqa: N802  (Qt naming)
+        # Closing the window ends the session; leaving the arm live with no visible
+        # controls is worse than shutting down.
+        self._dispatch("quit")
+        super().closeEvent(event)
 
-        h, w = view.shape[:2]
-        canvas = np.full((h + FOOTER_H, w + PANEL_W, 3), _BG, dtype=np.uint8)
-        canvas[:h, :w] = view
-
-        self._draw_panel(canvas, status, x0=w, height=h)
-        self._draw_footer(canvas, y0=h, width=w + PANEL_W)
-        return canvas
-
-    def _draw_panel(self, canvas: np.ndarray, status: RolloutStatus, x0: int, height: int) -> None:
-        x = x0 + _PAD
-        y = _PAD + 14
+    def on_update(self, frames: dict[str, np.ndarray], status: RolloutStatus) -> None:
+        """Slot for DisplayBridge.updated. Runs on the GUI thread."""
+        for name, tile in self.tiles.items():
+            tile.set_frame(frames.get(name))
 
         colour = _RUNNING if status.running else _IDLE
-        _put(canvas, status.state, (x, y + 10), 0.95, colour, 2)
-
-        if status.recording:
-            # Filled dot reads as "armed" faster than the word REC alone.
-            cv2.circle(canvas, (x0 + PANEL_W - _PAD - 46, y + 3), 6, _REC, -1)
-            _put(canvas, "REC", (x0 + PANEL_W - _PAD - 34, y + 9), 0.55, _REC, 1)
-
-        y += 34
-        cv2.line(canvas, (x, y), (x0 + PANEL_W - _PAD, y), _RULE, 1)
-        y += 26
+        self.state_label.setText(status.state)
+        self.state_label.setStyleSheet(f"color: {colour};")
+        self.rec_label.setText("● REC" if status.recording else "")
+        self.task_label.setText(status.task)
+        self.message_label.setText(status.message)
+        self.message_label.setStyleSheet(f"color: {colour}; font-size: 11px;")
 
         for label, formatter in [*PANEL_ROWS, *self.extra_rows]:
             try:
@@ -257,30 +330,24 @@ class RolloutDisplay:
             except Exception as e:  # a bad row must not take the window down
                 logger.debug("Panel row %r failed: %s", label, e)
                 value = "?"
-            _put(canvas, label, (x, y), 0.48, _DIM)
-            _put(canvas, value, (x + 108, y), 0.52, _TEXT)
-            y += 26
+            self._set_row(label, value)
 
-        y += 10
-        cv2.line(canvas, (x, y), (x0 + PANEL_W - _PAD, y), _RULE, 1)
-        y += 24
+    def _set_row(self, label: str, value: str) -> None:
+        widget = self._row_labels.get(label)
+        if widget is None:
+            row = QHBoxLayout()
+            caption = QLabel(label)
+            caption.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
+            widget = QLabel(value)
+            widget.setStyleSheet(f"color: {_TEXT}; font-size: 12px;")
+            row.addWidget(caption)
+            row.addStretch(1)
+            row.addWidget(widget)
+            self.rows_container.addLayout(row)
+            self._row_labels[label] = widget
+        widget.setText(value)
 
-        inner_w = PANEL_W - 2 * _PAD
 
-        _put(canvas, "TASK", (x, y), 0.42, _DIM)
-        y += 20
-        for line in _wrap(status.task, inner_w, 0.46, 3):
-            _put(canvas, line, (x, y), 0.46, _TEXT)
-            y += 18
-
-        if status.message:
-            # Pinned to the bottom so it does not shift as the task wraps.
-            my = height - _PAD - 4
-            for line in reversed(_wrap(status.message, inner_w, 0.46, 2)):
-                _put(canvas, line, (x, my), 0.46, colour)
-                my -= 18
-
-    def _draw_footer(self, canvas: np.ndarray, y0: int, width: int) -> None:
-        cv2.line(canvas, (0, y0), (width, y0), _RULE, 1)
-        if self.controls_help:
-            _put(canvas, self.controls_help, (_PAD, y0 + 22), 0.48, _DIM)
+def make_app() -> QApplication:
+    """The process-wide QApplication, created once."""
+    return QApplication.instance() or QApplication([])

@@ -166,18 +166,36 @@ class RobotClientConfig:
         metadata={"help": "Keyboard backend: terminal (focused window only) | auto"},
     )
 
+    # --- Policy inputs ----------------------------------------------------------------
+    # Which of the robot's cameras the policy actually consumes. Empty means all of
+    # them, which is the historical behaviour.
+    #
+    # This matters because the server indexes `policy_image_features[key]` directly for
+    # every image the client sends, so a camera the checkpoint was not trained on is a
+    # KeyError mid-rollout, not a silently ignored extra. Cameras left out here are
+    # still captured, recorded and displayed - they just never reach the policy, which
+    # also keeps them off the wire (observations are raw uint8, so each 640x360 stream
+    # is another 0.66 MB per upload, and the upload blocks the control loop).
+    policy_cameras: list[str] = field(
+        default_factory=list,
+        metadata={"help": "Cameras the policy consumes (default: all of the robot's cameras)"},
+    )
+
     # --- Live display -----------------------------------------------------------------
     # An OpenCV window with the camera feed and rollout status. It is also a second
     # key source, so the controls work whether the window or the terminal has focus.
     display: bool = field(default=False, metadata={"help": "Show the camera + status window"})
-    display_camera: str = field(
-        default="", metadata={"help": "Which camera to show (default: the first one)"}
+    display_cameras: list[str] = field(
+        default_factory=list,
+        metadata={"help": "Cameras to show, in order (default: all of the robot's cameras)"},
     )
     display_fps: float = field(
         default=15.0,
         metadata={"help": "Window refresh rate. Below the control rate on purpose - drawing costs time"},
     )
-    display_scale: float = field(default=1.0, metadata={"help": "Scale factor applied to the camera image"})
+    display_tile_width: int = field(
+        default=480, metadata={"help": "Width in pixels of each camera tile in the window"}
+    )
 
     # --- Episodic recording -----------------------------------------------------------
     # Each start->stop span is one episode. Unset `record_root` to run without recording.
@@ -276,8 +294,8 @@ class RobotClientConfig:
         if self.display_fps <= 0:
             raise ValueError(f"display_fps must be positive, got {self.display_fps}")
 
-        if self.display_scale <= 0:
-            raise ValueError(f"display_scale must be positive, got {self.display_scale}")
+        if self.display_tile_width <= 0:
+            raise ValueError(f"display_tile_width must be positive, got {self.display_tile_width}")
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "RobotClientConfig":

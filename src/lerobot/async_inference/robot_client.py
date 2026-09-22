@@ -47,6 +47,16 @@ Stopping does not disconnect the robot: torque stays on and the arm holds positi
 startup; `c` then re-handshakes against the server's resident-policy cache, which is
 near-instant and resets per-episode policy state.
 
+`--display` opens a PyQt5 window with one tile per camera, a status panel and
+clickable controls. It is a second input path: buttons and window keystrokes land in
+the same command queue the terminal listener feeds.
+
+Cameras the checkpoint was not trained on go in every other direction but the server.
+List the policy's own cameras in `--policy_cameras`; the rest are still captured,
+recorded and displayed, but excluded from the upload, because the server looks up
+every incoming image in the checkpoint's declared image features and an unexpected
+one is a KeyError mid-rollout.
+
 Keys are read straight from the controlling TTY, so the terminal must be focused and
 keystrokes are not echoed while the client runs. `--keyboard_backend=auto` switches to
 pynput's global hook instead, which also fires when the terminal is in the background;
@@ -113,11 +123,12 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.utils.import_utils import (
     _datasets_available,
     _pandas_available,
+    _pyqt5_available,
     register_third_party_plugins,
     require_package,
 )
@@ -145,7 +156,12 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
-from .rollout_display import RolloutDisplay, RolloutStatus
+
+# The rollout window needs PyQt5, which is in the `viz` extra. Guarded so the
+# client still imports (and the policy still runs) without it; --display then
+# fails at setup with an actionable message rather than at import time.
+if TYPE_CHECKING or _pyqt5_available:
+    from .rollout_display import DisplayBridge, RolloutStatus, RolloutWindow
 
 
 def smooth_move_to(
@@ -217,7 +233,23 @@ class RobotClient:
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
 
-        lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
+        # Cameras the policy sees, versus cameras we merely capture. Anything excluded
+        # is still recorded and displayed but never reaches the server: it would be a
+        # KeyError there, since the server looks up every incoming image in the
+        # checkpoint's declared image features.
+        robot_cameras = list(getattr(self.robot, "cameras", {}) or {})
+        self.policy_cameras = list(config.policy_cameras) or robot_cameras
+        unknown = [c for c in self.policy_cameras if c not in robot_cameras]
+        if unknown:
+            raise ValueError(f"policy_cameras {unknown} are not robot cameras: {robot_cameras}")
+        self.observation_only_cameras = [c for c in robot_cameras if c not in self.policy_cameras]
+        if self.observation_only_cameras:
+            self.logger.info(
+                f"Policy sees {self.policy_cameras}; "
+                f"{self.observation_only_cameras} recorded and displayed only."
+            )
+
+        lerobot_features = self._policy_lerobot_features()
 
         # Use environment variable if server_address is not provided in config
         self.server_address = config.server_address
@@ -277,14 +309,34 @@ class RobotClient:
         self.dataset_features: dict[str, dict] | None = None
         self._home_poses: dict[int, dict[str, float]] | None = None
 
-        self.display: RolloutDisplay | None = None
-        self._display_camera = ""
+        self.bridge = None
+        self.window = None
+        self.display_cameras: list[str] = []
+        self._last_display = 0.0
+        self._display_period = 0.0
         # Short note shown in the status panel, so the window alone tells you what the
         # last action was without watching the log.
         self._message = ""
         # Timestamps of recent control ticks, for the measured loop rate. Bounded, so
         # the rate reflects the last second rather than the whole session.
         self._tick_times: deque[float] = deque(maxlen=60)
+
+    def _policy_lerobot_features(self) -> dict[str, dict]:
+        """The feature spec announced to the server, minus non-policy cameras.
+
+        The server trusts this to describe exactly what the client will send, so it has
+        to be filtered in lockstep with `_policy_observation`.
+        """
+        features = map_robot_keys_to_lerobot_features(self.robot)
+        excluded = {f"{OBS_IMAGES}.{camera}" for camera in self.observation_only_cameras}
+        return {key: spec for key, spec in features.items() if key not in excluded}
+
+    def _policy_observation(self, raw_observation: RawObservation) -> RawObservation:
+        """Strip cameras the policy was not trained on, before the observation goes out."""
+        if not self.observation_only_cameras:
+            return dict(raw_observation)
+        excluded = set(self.observation_only_cameras)
+        return {key: value for key, value in raw_observation.items() if key not in excluded}
 
     @property
     def running(self):
@@ -361,27 +413,40 @@ class RobotClient:
             self.logger.info("Waiting for the server to load the policy before accepting commands...")
 
     def _setup_display(self) -> None:
+        """Prepare the display plumbing. The window itself is built on the GUI thread."""
+        require_package("PyQt5", "async")
+
         cameras = list(getattr(self.robot, "cameras", {}) or {})
-        if not cameras:
-            self.logger.warning("display=True but the robot has no cameras - showing status only.")
+        requested = self.config.display_cameras
+        unknown = [c for c in requested if c not in cameras]
+        if unknown:
+            raise ValueError(f"display_cameras {unknown} are not robot cameras: {cameras}")
 
-        requested = self.config.display_camera
-        if requested and requested not in cameras:
-            raise ValueError(f"display_camera={requested!r} is not one of the robot's cameras: {cameras}")
-        self._display_camera = requested or (cameras[0] if cameras else "")
+        self.display_cameras = requested or cameras
+        if not self.display_cameras:
+            self.logger.warning("display=True but the robot has no cameras - status only.")
 
-        self.display = RolloutDisplay(
-            window_name=f"LeRobot rollout - {self._display_camera or 'no camera'}",
-            refresh_hz=self.config.display_fps,
-            scale=self.config.display_scale,
-            controls_help=self.CONTROLS_HELP,
+        # Only the signal object is made here. Widgets must be constructed on the
+        # thread that runs the Qt event loop, which is the main thread; async_client
+        # calls build_window() there.
+        self.bridge = DisplayBridge()
+        self._display_period = 1.0 / self.config.display_fps
+        self.logger.info(f"Display enabled for {self.display_cameras}.")
+
+    def build_window(self) -> "RolloutWindow":
+        """Construct the Qt window. MUST be called on the GUI (main) thread."""
+        self.window = RolloutWindow(
+            camera_names=self.display_cameras,
+            policy_cameras=self.policy_cameras,
+            # Buttons and keys both land in the same queue the TTY listener feeds, so
+            # every input path converges on _handle_commands.
+            on_command=self.commands.put,
+            tile_width=self.config.display_tile_width,
         )
-        self.logger.info(
-            f"Display window open (camera '{self._display_camera}'). "
-            "Keys work with either the window or the terminal focused."
-        )
+        self.bridge.updated.connect(self.window.on_update)
+        return self.window
 
-    def _status(self) -> RolloutStatus:
+    def _status(self) -> "RolloutStatus":
         """Snapshot of what the panel shows. Add fields here as the panel grows."""
         running = self.run_event.is_set()
         with self.action_queue_lock:
@@ -406,6 +471,7 @@ class RobotClient:
             target_fps=self.config.fps,
             task=self.config.task,
             message=self._message,
+            policy_cameras=list(self.policy_cameras),
         )
 
     def _measured_fps(self) -> float:
@@ -416,30 +482,26 @@ class RobotClient:
         return (len(self._tick_times) - 1) / span if span > 1e-6 else 0.0
 
     def _service_display(self, observation: RawObservation | None) -> RawObservation | None:
-        """Redraw if due, and route any window keypress into the same command queue.
+        """Push a frame to the window if one is due, on the control-loop thread.
 
-        Returns the observation it used, which may have been captured here: while idle
+        Returns the observation it used, which it may have captured itself: while idle
         the control loop takes no observations at all, but the feed still has to be
         live so the operator can see the scene they are resetting.
-        """
-        if self.display is None or not self.display.due():
-            return observation
 
-        if self.display.closed:
-            self.logger.info("Display window closed - continuing without it.")
-            self.display = None
+        Emits rather than touching widgets, because Qt objects belong to the GUI
+        thread and this runs on the worker.
+        """
+        if self.bridge is None:
+            return observation
+        if (time.perf_counter() - self._last_display) < self._display_period:
             return observation
 
         if observation is None:
             observation = self.robot.get_observation()
 
-        frame = observation.get(self._display_camera) if self._display_camera else None
-        self.display.update(frame, self._status())
-
-        key = self.display.poll_key()
-        if key is not None and self.config.interactive:
-            self._on_key(key)
-
+        self._last_display = time.perf_counter()
+        frames = {name: observation.get(name) for name in self.display_cameras}
+        self.bridge.updated.emit(frames, self._status())
         return observation
 
     def _make_listener(self):
@@ -1062,9 +1124,9 @@ class RobotClient:
         performed_action = self.control_loop_action(verbose) if self.actions_available() else None
 
         if self._ready_to_send_observation():
-            # Copies because send_captured_observation stamps "task" onto the dict and
-            # hands it to the serializer; the dataset frame should not carry that key.
-            self.send_captured_observation(dict(raw_observation), task, verbose)
+            # _policy_observation copies, which also keeps send_captured_observation's
+            # "task" stamp off the dict the dataset frame is built from.
+            self.send_captured_observation(self._policy_observation(raw_observation), task, verbose)
 
         # Record only on ticks that actually moved the arm, so the dataset's frame rate
         # matches the `fps` it declares.
@@ -1072,6 +1134,47 @@ class RobotClient:
             self._record_frame(raw_observation, performed_action, task)
 
         return raw_observation, performed_action
+
+
+def _run_session(client: RobotClient, cfg: RobotClientConfig, action_receiver_thread) -> None:
+    """Run the control loop and tear the session down.
+
+    Factored out of `async_client` because it runs on the main thread normally, but on
+    a worker when the Qt window owns the main thread.
+    """
+    try:
+        if client.dataset is not None:
+            # VideoEncodingManager flushes pending video and calls finalize() on the
+            # way out, so do NOT finalize again below. The rescue-save has to sit
+            # *inside* it: on the exception path __exit__ cancels pending videos, so
+            # an episode saved after it would lose its footage.
+            with VideoEncodingManager(client.dataset):
+                try:
+                    client.control_loop(task=cfg.task)
+                finally:
+                    # Rescue a half-recorded episode from a crash or Ctrl+C. In the
+                    # normal 'q' path the stop already saved and cleared the buffer,
+                    # so this finds nothing pending.
+                    with contextlib.suppress(Exception):
+                        if client.dataset.has_pending_frames():
+                            client.logger.info("Saving in-progress episode before exit...")
+                            client.dataset.save_episode()
+        else:
+            client.control_loop(task=cfg.task)
+
+    finally:
+        if client.listener is not None:
+            client.listener.stop()
+
+        client.stop()
+        action_receiver_thread.join()
+        if cfg.debug_visualize_queue_size:
+            visualize_action_queue_size(client.action_queue_size)
+        client.logger.info("Client stopped")
+
+        # Release the Qt event loop, if one is waiting on us.
+        if client.bridge is not None:
+            client.bridge.closed.emit()
 
 
 @draccus.wrap()
@@ -1085,51 +1188,40 @@ def async_client(cfg: RobotClientConfig):
     client = RobotClient(cfg)
     client.setup_interactive()
 
-    if client.start():
-        if cfg.interactive:
-            # Reached only after the checkpoint is resident, so 'c' is now genuinely fast.
-            client.logger.info(f"Policy loaded. IDLE - controls: {client.CONTROLS_HELP}")
+    if not client.start():
+        return
 
-        client.logger.info("Starting action receiver thread...")
+    if cfg.interactive:
+        # Reached only after the checkpoint is resident, so 'c' is now genuinely fast.
+        client.logger.info(f"Policy loaded. IDLE - controls: {client.CONTROLS_HELP}")
 
-        # Create and start action receiver thread
-        action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+    client.logger.info("Starting action receiver thread...")
+    action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+    action_receiver_thread.start()
 
-        # Start action receiver thread
-        action_receiver_thread.start()
+    if client.bridge is None:
+        _run_session(client, cfg, action_receiver_thread)
+        return
 
-        try:
-            if client.dataset is not None:
-                # VideoEncodingManager flushes pending video and calls finalize() on the
-                # way out, so do NOT finalize again below. The rescue-save has to sit
-                # *inside* it: on the exception path __exit__ cancels pending videos, so
-                # an episode saved after it would lose its footage.
-                with VideoEncodingManager(client.dataset):
-                    try:
-                        client.control_loop(task=cfg.task)
-                    finally:
-                        # Rescue a half-recorded episode from a crash or Ctrl+C. In the
-                        # normal 'q' path the stop already saved and cleared the buffer,
-                        # so this finds nothing pending.
-                        with contextlib.suppress(Exception):
-                            if client.dataset.has_pending_frames():
-                                client.logger.info("Saving in-progress episode before exit...")
-                                client.dataset.save_episode()
-            else:
-                client.control_loop(task=cfg.task)
+    # With a window, Qt takes the main thread: widgets may only be touched from the
+    # thread that created them, and on macOS that has to be the main one. The control
+    # loop moves to a worker and reaches the GUI only through the bridge's signals.
+    from .rollout_display import make_app
 
-        finally:
-            if client.listener is not None:
-                client.listener.stop()
+    app = make_app()
+    window = client.build_window()
+    client.bridge.closed.connect(app.quit)
+    window.show()
 
-            if client.display is not None:
-                client.display.close()
-
-            client.stop()
-            action_receiver_thread.join()
-            if cfg.debug_visualize_queue_size:
-                visualize_action_queue_size(client.action_queue_size)
-            client.logger.info("Client stopped")
+    worker = threading.Thread(target=_run_session, args=(client, cfg, action_receiver_thread))
+    worker.start()
+    try:
+        app.exec_()
+    finally:
+        # Closing the window asks the loop to quit; make sure it actually did before
+        # returning, so the dataset is finalised and the robot disconnected cleanly.
+        client.shutdown_event.set()
+        worker.join()
 
 
 if __name__ == "__main__":
