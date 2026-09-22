@@ -212,6 +212,19 @@ class RobotClientConfig:
         default=4, metadata={"help": "Image-writer threads per camera while recording"}
     )
 
+    # Stopping parks the episode until it is labelled 'y' (success) or 'n' (failure),
+    # written to the dataset's `next.success` column. An eval rollout without an
+    # outcome is most of the way to useless, so the label is required rather than
+    # optional: quitting with one outstanding discards it rather than guessing.
+    annotate_success: bool = field(
+        default=True, metadata={"help": "Require y/n after each episode before it is saved"}
+    )
+
+    # --- Shutdown ---------------------------------------------------------------------
+    # Disconnecting cuts torque and the arm falls from wherever it stopped, so park it
+    # first. Needs rest_pose to be set; without one this warns and skips.
+    rest_on_exit: bool = field(default=True, metadata={"help": "Drive to the rest pose before disconnecting"})
+
     # --- Rest / home poses ------------------------------------------------------------
     # Joint targets in the robot's own action space, e.g. {shoulder_pan.pos: 0.0, ...}.
     # Body joints are normalized to [-100, 100] and the gripper to [0, 100], the same

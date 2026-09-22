@@ -80,6 +80,10 @@ class RolloutStatus:
     target_fps: float = 30.0
     task: str = ""
     message: str = ""
+    # True between a stop and its y/n label, when the panel should be asking for one.
+    awaiting_annotation: bool = False
+    successes: int = 0
+    failures: int = 0
     # Cameras the policy actually consumes, so the tiles can say which is which.
     policy_cameras: list[str] = field(default_factory=list)
 
@@ -90,21 +94,31 @@ PANEL_ROWS: list[tuple[str, Callable[[RolloutStatus], str]]] = [
     ("Frames", lambda s: str(s.frames) if s.recording else "-"),
     ("Queue", lambda s: f"{s.queue}/{s.chunk}" if s.chunk > 0 else str(s.queue)),
     ("Loop Hz", lambda s: f"{s.fps:.1f} / {s.target_fps:.0f}"),
+    ("Outcome", lambda s: f"{s.successes} ok / {s.failures} fail"),
 ]
 
 # Buttons rendered under the panel, as (label, command). Commands are the same
 # strings the keyboard produces, so both paths converge on one handler.
 CONTROL_BUTTONS: list[tuple[str, str]] = [
     ("Start  (c)", "start"),
-    ("Stop + save  (s)", "stop"),
+    ("Stop  (s)", "stop"),
     ("Discard  (d)", "discard"),
     ("Rest  (r)", "rest"),
     ("Home  (h)", "home"),
 ]
 
+# Shown only while an episode is waiting to be labelled, so the two outcome buttons
+# cannot be clicked at a moment when they would mean nothing.
+ANNOTATION_BUTTONS: list[tuple[str, str, str]] = [
+    ("Success  (y)", "success", "#2f6b3a"),
+    ("Failure  (n)", "failure", "#7a2f2f"),
+]
+
 _KEY_TO_COMMAND = {
     Qt.Key_C: "start",
     Qt.Key_S: "stop",
+    Qt.Key_Y: "success",
+    Qt.Key_N: "failure",
     Qt.Key_D: "discard",
     Qt.Key_R: "rest",
     Qt.Key_H: "home",
@@ -255,6 +269,7 @@ class RolloutWindow(QMainWindow):
         layout.addWidget(self.task_label)
 
         layout.addStretch(1)
+        layout.addWidget(self._build_annotation())
         layout.addWidget(self._build_controls())
 
         self.message_label = QLabel("")
@@ -263,6 +278,31 @@ class RolloutWindow(QMainWindow):
         layout.addWidget(self.message_label)
 
         return panel
+
+    def _build_annotation(self) -> QWidget:
+        """Success / failure buttons, hidden until an episode is waiting for a label."""
+        self.annotation_box = QWidget()
+        layout = QVBoxLayout(self.annotation_box)
+        layout.setContentsMargins(0, 0, 0, 6)
+        layout.setSpacing(4)
+
+        prompt = QLabel("How did it go?")
+        prompt.setStyleSheet(f"color: {_TEXT}; font-size: 11px; font-weight: bold;")
+        layout.addWidget(prompt)
+
+        for label, command, colour in ANNOTATION_BUTTONS:
+            button = QPushButton(label)
+            button.setStyleSheet(
+                f"QPushButton {{ background: {colour}; color: {_TEXT}; border: none;"
+                f" padding: 7px; border-radius: 4px; font-size: 12px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: #4a4a54; }}"
+            )
+            button.clicked.connect(lambda _, c=command: self._dispatch(c))
+            button.setFocusPolicy(Qt.NoFocus)
+            layout.addWidget(button)
+
+        self.annotation_box.setVisible(False)
+        return self.annotation_box
 
     def _build_controls(self) -> QWidget:
         box = QWidget()
@@ -320,6 +360,8 @@ class RolloutWindow(QMainWindow):
         self.state_label.setText(status.state)
         self.state_label.setStyleSheet(f"color: {colour};")
         self.rec_label.setText("● REC" if status.recording else "")
+        # Only offer the outcome buttons when an outcome is actually pending.
+        self.annotation_box.setVisible(status.awaiting_annotation)
         self.task_label.setText(status.task)
         self.message_label.setText(status.message)
         self.message_label.setStyleSheet(f"color: {colour}; font-size: 11px;")

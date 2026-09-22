@@ -36,14 +36,25 @@ Interactive mode (`--interactive=true`) drives the session from the keyboard ins
 running from startup to Ctrl+C, and records each start->stop span as one episode:
 
     c  start the policy (and begin a new episode)
-    s  stop the policy and save the episode
-    d  stop the policy and discard the episode
+    s  stop the policy; the episode waits for its outcome
+    y  label the episode a success and save it
+    n  label it a failure and save it
+    d  discard the episode
     r  move to the folded rest pose      (idle only)
     h  move to a home pose               (idle only)
-    q  save and exit
+    q  park at the rest pose and exit
 
 Stopping does not disconnect the robot: torque stays on and the arm holds position, so
-`s` is an episode boundary rather than a shutdown. The checkpoint still loads once at
+`s` is an episode boundary rather than a shutdown.
+
+With `--annotate_success` (the default) a stopped episode is held open until it is
+labelled, and every other transition is refused until then, so a rollout cannot drift
+past unlabelled. The label lands in the dataset's `next.success` column -- the same
+one `lerobot-eval` writes. Quitting with one outstanding discards it rather than
+inventing an outcome.
+
+Exiting parks the arm at the rest pose first (`--rest_on_exit`), because disconnecting
+cuts torque and the arm would otherwise fall from wherever it stopped. The checkpoint still loads once at
 startup; `c` then re-handshakes against the server's resident-policy cache, which is
 near-instant and resets per-episode policy state.
 
@@ -92,6 +103,7 @@ from typing import TYPE_CHECKING, Any
 
 import draccus
 import grpc
+import numpy as np
 import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
@@ -123,7 +135,7 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STR, SUCCESS
 from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.utils.import_utils import (
     _datasets_available,
@@ -317,6 +329,12 @@ class RobotClient:
         # Short note shown in the status panel, so the window alone tells you what the
         # last action was without watching the log.
         self._message = ""
+        # Set between a stop and its y/n label. While true the episode buffer is
+        # still open and every other transition is refused, so a rollout cannot be
+        # silently left unlabelled.
+        self._awaiting_annotation = False
+        self._successes = 0
+        self._failures = 0
         # Timestamps of recent control ticks, for the measured loop rate. Bounded, so
         # the rate reflects the last second rather than the whole session.
         self._tick_times: deque[float] = deque(maxlen=60)
@@ -384,7 +402,7 @@ class RobotClient:
 
     # ------------------------------------------------------------------ interactive --
 
-    CONTROLS_HELP = "c=start, s=stop+save, d=discard, r=rest, h=home, q=quit"
+    CONTROLS_HELP = "c=start, s=stop, y=success, n=failure, d=discard, r=rest, h=home, q=quit"
 
     def setup_interactive(self) -> None:
         """Open the rollout dataset and attach the keyboard listener."""
@@ -471,6 +489,9 @@ class RobotClient:
             target_fps=self.config.fps,
             task=self.config.task,
             message=self._message,
+            awaiting_annotation=self._awaiting_annotation,
+            successes=self._successes,
+            failures=self._failures,
             policy_cameras=list(self.policy_cameras),
         )
 
@@ -550,6 +571,12 @@ class RobotClient:
             **hw_to_dataset_features(self.robot.observation_features, OBS_STR, self.config.record_video),
             **hw_to_dataset_features(self.robot.action_features, ACTION, self.config.record_video),
         }
+        if self.config.annotate_success:
+            # Same column lerobot_eval writes, so these rollouts read back like any
+            # other evaluation dataset. It is per-frame because that is the only
+            # granularity a LeRobotDataset has; every frame in an episode carries that
+            # episode's outcome.
+            features[SUCCESS] = {"dtype": "bool", "shape": (1,), "names": None}
         root = Path(self.config.record_root)
         num_cameras = len(getattr(self.robot, "cameras", {}) or {})
         writer_threads = self.config.num_image_writer_threads * num_cameras
@@ -596,6 +623,8 @@ class RobotClient:
         action = {
             "c": "start",
             "s": "stop",
+            "y": "success",
+            "n": "failure",
             "d": "discard",
             "r": "rest",
             "h": "home",
@@ -615,7 +644,23 @@ class RobotClient:
 
         if command == "quit":
             self._stop_policy(save=True)
+            if self._awaiting_annotation:
+                # Refuse to invent a label. The placeholder column says "failure",
+                # which would be a fabricated result in an evaluation dataset.
+                self.logger.warning(
+                    "Quitting with an unlabelled episode - discarding it. "
+                    "Press 'y' or 'n' before 'q' to keep it."
+                )
+                self._discard_episode()
             self.shutdown_event.set()
+        elif command in ("success", "failure"):
+            self._annotate_and_save(command == "success")
+        elif command == "discard" and self._awaiting_annotation:
+            self._discard_episode()
+        elif self._awaiting_annotation:
+            # Everything else waits: an unlabelled rollout is most of the way to
+            # useless, so make the operator resolve it rather than drift onward.
+            self.logger.info(f"Label the last episode first - 'y', 'n', or 'd' (ignored '{command}').")
         elif command == "start":
             self._start_policy()
         elif command == "stop":
@@ -687,15 +732,54 @@ class RobotClient:
             self.logger.info("No frames recorded - nothing to save.")
             return
 
-        if save:
-            self.logger.info("Saving episode (encoding, this blocks for a moment)...")
-            self.dataset.save_episode()
-            self._message = f"Saved episode {self.dataset.num_episodes - 1}"
-            self.logger.info(f"Saved. Dataset now holds {self.dataset.num_episodes} episodes.")
-        else:
+        if not save:
+            self._discard_episode()
+            return
+
+        if self.config.annotate_success:
+            # Hold the buffer open. Saving happens in _annotate_and_save once the
+            # operator says how it went.
+            self._awaiting_annotation = True
+            self._message = "Success? y / n  (d discards)"
+            self.logger.info("Episode complete - press 'y' for success, 'n' for failure, 'd' to discard.")
+            return
+
+        self._save_episode()
+
+    def _discard_episode(self) -> None:
+        """Drop the open episode buffer. Safe whether or not the policy is running."""
+        if self.dataset is not None and self.dataset.has_pending_frames():
             self.dataset.clear_episode_buffer()
-            self._message = "Discarded episode"
-            self.logger.info("Discarded episode.")
+        self._awaiting_annotation = False
+        self._message = "Discarded episode"
+        self.logger.info("Discarded episode.")
+
+    def _save_episode(self) -> None:
+        self.logger.info("Saving episode (encoding, this blocks for a moment)...")
+        self.dataset.save_episode()
+        self._awaiting_annotation = False
+        self.logger.info(f"Saved. Dataset now holds {self.dataset.num_episodes} episodes.")
+
+    def _annotate_and_save(self, success: bool) -> None:
+        """Label the parked episode and write it out."""
+        if not self._awaiting_annotation:
+            self.logger.info("Nothing to annotate - press 's' to end an episode first.")
+            return
+
+        outcome = "success" if success else "failure"
+        buffer = self.dataset.writer.episode_buffer
+        size = buffer["size"]
+        # Overwrite the whole column: the value is a property of the episode, and the
+        # per-frame placeholders written during the rollout were never meaningful.
+        buffer[SUCCESS] = [np.array([success]) for _ in range(size)]
+
+        self._save_episode()
+        if success:
+            self._successes += 1
+        else:
+            self._failures += 1
+        self._message = f"Episode {self.dataset.num_episodes - 1}: {outcome}"
+        self.logger.info(f"Episode {self.dataset.num_episodes - 1} recorded as {outcome} ({size} frames).")
 
     def _drain_action_queue(self) -> None:
         with self.action_queue_lock:
@@ -768,7 +852,14 @@ class RobotClient:
     def _record_frame(self, observation: RawObservation, action: dict[str, Any], task: str) -> None:
         observation_frame = build_dataset_frame(self.dataset_features, observation, prefix=OBS_STR)
         action_frame = build_dataset_frame(self.dataset_features, action, prefix=ACTION)
-        self.dataset.add_frame({**observation_frame, **action_frame, "task": task})
+        frame = {**observation_frame, **action_frame, "task": task}
+        if self.config.annotate_success:
+            # add_frame demands every declared feature, but the outcome is not known
+            # until the episode ends, so seed it and overwrite the whole column in
+            # _annotate_and_save. An episode that never gets labelled is discarded
+            # rather than saved with this placeholder.
+            frame[SUCCESS] = np.array([False])
+        self.dataset.add_frame(frame)
 
     def send_observation(
         self,
@@ -1085,27 +1176,56 @@ class RobotClient:
         _performed_action = None
         _captured_observation = None
 
-        while self.running:
-            control_loop_start = time.perf_counter()
-            self._tick_times.append(control_loop_start)
+        try:
+            while self.running:
+                control_loop_start = time.perf_counter()
+                self._tick_times.append(control_loop_start)
 
-            # May block for seconds on a rest/home move, but only ever while idle.
-            self._handle_commands()
+                # May block for seconds on a rest/home move, but only ever while idle.
+                self._handle_commands()
 
-            tick_observation = None
-            if self.run_event.is_set():
-                _captured_observation, _performed_action = self.control_loop_tick(task, verbose)
-                tick_observation = _captured_observation
+                tick_observation = None
+                if self.run_event.is_set():
+                    _captured_observation, _performed_action = self.control_loop_tick(task, verbose)
+                    tick_observation = _captured_observation
 
-            # Reuses the tick's observation when running, and captures its own at the
-            # (slower) refresh rate when idle, so the feed stays live between episodes.
-            self._service_display(tick_observation)
+                # Reuses the tick's observation when running, and captures its own at
+                # the (slower) refresh rate when idle, so the feed stays live between
+                # episodes.
+                self._service_display(tick_observation)
 
-            self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
-            # Dynamically adjust sleep time to maintain the desired control frequency
-            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+                self.logger.debug(
+                    f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}"
+                )
+                # Dynamically adjust sleep time to maintain the desired control frequency
+                time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+        finally:
+            # Park here rather than in the caller's teardown: this is the only thread
+            # allowed to drive the bus, and a `finally` catches the Ctrl+C path too,
+            # which would otherwise skip straight to a torque-off disconnect.
+            self._park_before_exit()
 
         return _captured_observation, _performed_action
+
+    def _park_before_exit(self) -> None:
+        """Drive to the rest pose so disconnecting does not drop the arm.
+
+        stop() disconnects, which honours disable_torque_on_disconnect and lets the arm
+        fall from wherever it happened to stop. Folding first makes that harmless.
+        """
+        if not self.config.rest_on_exit:
+            return
+        if not self.config.rest_pose:
+            self.logger.warning("No rest_pose configured - skipping park, the arm will drop on exit.")
+            return
+
+        self.run_event.clear()  # nothing else should be driving while we park
+        try:
+            self.logger.info("Parking at the rest pose before shutdown...")
+            self._move_to_pose("rest")
+        except Exception:
+            # Never let a failed park mask the original error or block teardown.
+            self.logger.exception("Could not park the arm; it will drop when torque cuts.")
 
     def control_loop_tick(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """One policy-driven tick: observe, act, upload, record.
