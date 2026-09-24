@@ -393,10 +393,10 @@ def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str =
     return None
 
 
-def init_keyboard_listener():
+def init_keyboard_listener(backend: str = "auto"):
     """Initialize a non-blocking keyboard listener for interactive recording controls.
 
-    Backend selection:
+    Backend selection with ``backend="auto"``:
 
     * ``pynput`` global listener when :func:`pynput_can_capture` is true (real
       X11, macOS, Windows). On macOS the listener's ``IS_TRUSTED`` flag is checked
@@ -411,6 +411,12 @@ def init_keyboard_listener():
     equivalents ``n`` (next), ``r`` (re-record) and ``q`` (quit). The letters are the most
     reliable choice over high-latency SSH/VNC links, where arrow-key escape sequences can
     be split, delayed, or intercepted by the terminal.
+
+    Args:
+        backend: ``"auto"`` for the selection above, or ``"terminal"`` to read the
+            controlling TTY unconditionally. Prefer ``"terminal"`` when the auto
+            selection cannot be trusted to detect its own failure -- see the comment
+            in the body, and :meth:`RobotClient._make_listener`, which defaults to it.
 
     Returns:
         A tuple ``(listener, events)`` where ``listener`` exposes ``.stop()`` or is
@@ -436,5 +442,37 @@ def init_keyboard_listener():
             apply_recording_control("esc", events)
         # other keys (incl. up/down) are intentionally ignored
 
-    listener = create_key_listener(on_key, controls_help="Right/Left/Esc, or n=next, r=re-record, q=quit")
+    controls_help = "Right/Left/Esc, or n=next, r=re-record, q=quit"
+
+    if backend == "auto":
+        return create_key_listener(on_key, controls_help=controls_help), events
+
+    if backend != "terminal":
+        raise ValueError(f"Unknown keyboard backend {backend!r}; expected 'auto' or 'terminal'.")
+
+    # Explicit "terminal" skips the auto-selection rather than losing to it. On macOS the
+    # auto path keeps pynput whenever its trust probe passes, but that probe asks whether
+    # Accessibility is granted (`AXIsProcessTrusted`), not whether the listen-only event
+    # tap pynput actually installs delivers anything. Inside an Electron host such as VS
+    # Code's integrated terminal the two disagree: TCC attributes the tap to a helper
+    # binary that was never granted, so the probe passes, pynput wins the selection, and
+    # no key ever arrives -- and the terminal fallback never engages because nothing
+    # reported failure. Reading the controlling TTY has no such ambiguity, which is why
+    # `RobotClient._make_listener` defaults to this backend for the same reason.
+    # `sys.stdin` is None, not just a non-TTY, in a fully detached process (pythonw, some
+    # nohup/service setups), so check it before asking it anything.
+    if sys.stdin is None or not sys.stdin.isatty():
+        # TerminalKeyListener.start() is a silent no-op without a TTY, which would leave
+        # the caller holding a listener that never fires. Say so, and return no listener
+        # -- the same contract the auto path uses for non-interactive runs.
+        logger.warning(
+            "Keyboard backend 'terminal' needs stdin to be an interactive terminal, but it is "
+            "redirected or piped; keyboard controls (%s) are disabled.",
+            controls_help,
+        )
+        return None, events
+
+    listener = TerminalKeyListener(on_key)
+    listener.start()
+    logger.info("Using terminal keyboard input — keep this terminal focused (%s).", controls_help)
     return listener, events
