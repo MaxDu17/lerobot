@@ -46,6 +46,13 @@ controls as buttons, and a panel that flags a stalled camera or a loop running u
 fps.  Unlike the other two it runs in-process and takes the main thread, so the record loop moves
 to a worker; ``--display_fps`` and ``--display_tile_width`` size it.
 
+``--dataset_cameras='[front]'`` keeps the other cameras out of the dataset: they are still
+captured and shown, but never become training data. ``--sidecar_dir=<dir>`` writes each saved
+episode's joint data plus every camera to a side recording that, unlike the dataset, is readable
+while the session is still running (``lerobot.utils.record_sidecar``). ``--review_command`` adds
+a "Review last N" button to the pyqt window that runs a command in the background -- typically a
+reviewer reading the sidecar -- and shows its stdout as markdown.
+
 Pass ``--rest_pose="{shoulder_pan.pos: 0.0, ...}"`` to park the arm before disconnecting, on every
 exit path.  Disconnecting cuts torque, so without it the arm drops when the session ends -- after
 the last episode, on ``q``, and on Ctrl+C alike.  Capture a pose with ``tools/capture_pose.py``;
@@ -105,6 +112,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from pprint import pformat
 
 from lerobot.cameras import CameraConfig  # noqa: F401
@@ -229,6 +237,23 @@ class RecordConfig:
     # and the window is for watching the scene, not for measuring it.
     display_fps: float = 15.0
     display_tile_width: int = 480
+    # Shell command behind the window's "Review last N" button, run in the background
+    # (at low priority, so the loop keeps its rate). Its stdout is shown in the window as
+    # markdown. {last}, {sidecar_dir} and {dataset_root} are substituted. Unset: no button.
+    review_command: str | None = None
+    review_default_last: int = 5
+
+    # --- Cameras and the sidecar ------------------------------------------------------
+    # Cameras written into the dataset. Empty (the default) means every robot camera.
+    # Any other camera is still captured, shown in the window and written to the sidecar,
+    # but is not a dataset feature: a view kept for review, never something to train on.
+    # Same idea as `--policy_cameras` in the async client.
+    dataset_cameras: list[str] = field(default_factory=list)
+    # Directory for the per-episode side recording (`lerobot.utils.record_sidecar`): the
+    # saved episodes' joint data plus every camera at `sidecar_width`, readable while the
+    # session is still running, which the dataset is not. Unset: no sidecar.
+    sidecar_dir: str | None = None
+    sidecar_width: int = 640
 
     # --- Rest pose --------------------------------------------------------------------
     # Disconnecting cuts torque, so without this the arm drops on EVERY exit - finishing
@@ -301,6 +326,7 @@ def record_loop(
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
     display_hook: Callable[[RobotObservation, bool], None] | None = None,
+    frame_hook: Callable[[dict, RobotObservation], None] | None = None,
     timer: CycleTimer | None = None,
 ):
     """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
@@ -309,6 +335,10 @@ def record_loop(
     the teleoperator produced nothing, and is how the pyqt window is fed.  It is
     independent of *display_data*, which drives the rerun/foxglove loggers: a caller
     picks one or the other, never both.
+
+    *frame_hook* is called with every frame handed to the dataset, and the processed
+    observation it came from (which also carries cameras the dataset leaves out).  It is
+    how the sidecar sees exactly the frames the dataset does.
 
     *timer* lets a caller that runs several phases — :func:`record` records one episode
     per call, with an unrecorded reset phase in between — keep one
@@ -429,6 +459,8 @@ def record_loop(
                 action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
                 frame = {**observation_frame, **action_frame, "task": single_task}
                 dataset.add_frame(frame)
+                if frame_hook is not None:
+                    frame_hook(frame, obs_processed)
 
         if display_data:
             with timer.section("telemetry"):
@@ -488,12 +520,27 @@ class _RecordDisplay:
 
     def build_window(self):
         """Construct the Qt window. MUST be called on the GUI (main) thread."""
-        from lerobot.utils.record_display import RecordWindow
+        from lerobot.utils.record_display import RecordWindow, ReviewSettings
 
+        cfg = self.cfg
+        review = None
+        if cfg.review_command:
+            review = ReviewSettings(
+                command=cfg.review_command,
+                default_last=cfg.review_default_last,
+                substitutions={
+                    "sidecar_dir": str(Path(cfg.sidecar_dir).resolve()) if cfg.sidecar_dir else "",
+                    "dataset_root": str(cfg.dataset.root or ""),
+                },
+            )
+        left_out = [c for c in self.camera_names if cfg.dataset_cameras and c not in cfg.dataset_cameras]
+        notes = dict.fromkeys(left_out, "not in dataset")
         self.window = RecordWindow(
             camera_names=self.camera_names,
             on_command=self.dispatch,
-            tile_width=self.cfg.display_tile_width,
+            tile_width=cfg.display_tile_width,
+            camera_notes=notes,
+            review=review,
         )
         self.bridge.updated.connect(self.window.on_update)
         return self.window
@@ -575,6 +622,29 @@ class _RecordDisplay:
         self.bridge.updated.emit(frames or {}, status)
 
 
+def dataset_observation_features(robot: Robot, dataset_cameras: list[str]) -> dict:
+    """``robot.observation_features`` without the cameras left out of *dataset_cameras*.
+
+    Empty *dataset_cameras* keeps every camera.  A camera that is not a feature never
+    reaches the dataset: frames are built from the feature spec, so its images are simply
+    not picked up, while the robot still captures them for the window and the sidecar.
+    """
+    features = robot.observation_features
+    if not dataset_cameras:
+        return features
+    cameras = list(getattr(robot, "cameras", {}) or {})
+    unknown = sorted(set(dataset_cameras) - set(cameras))
+    if unknown:
+        raise ValueError(f"dataset_cameras {unknown} are not robot cameras: {cameras}")
+    dropped = {c for c in cameras if c not in dataset_cameras}
+    # a depth-enabled camera also contributes "<name>_depth"
+    return {
+        k: v
+        for k, v in features.items()
+        if k not in dropped and not (k.endswith("_depth") and k[: -len("_depth")] in dropped)
+    }
+
+
 def _park_at_rest(robot: Robot, cfg: RecordConfig) -> None:
     """Drive the arm to ``cfg.rest_pose`` before it is disconnected.
 
@@ -634,6 +704,9 @@ def _run_session(
     """
     dataset = None
     listener = None
+    sidecar = None
+    # Image writers are per dataset camera; a camera kept out of the dataset needs none.
+    num_cameras = sum(1 for ft in dataset_features.values() if ft["dtype"] in ("image", "video"))
     # One timer for the whole session, so its statistics describe the recording rather
     # than one episode's slice of it.  The reset phases below deliberately run on their
     # own private timers: they write no frames, so folding their ticks in would dilute
@@ -648,7 +721,6 @@ def _run_session(
 
     try:
         if cfg.resume:
-            num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
             dataset = LeRobotDataset.resume(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -681,7 +753,7 @@ def _run_session(
                 features=dataset_features,
                 use_videos=cfg.dataset.video,
                 image_writer_processes=cfg.dataset.num_image_writer_processes,
-                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * num_cameras,
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 rgb_encoder=cfg.dataset.rgb_encoder,
                 depth_encoder=cfg.dataset.depth_encoder,
@@ -692,6 +764,21 @@ def _run_session(
 
         if display is not None:
             display.dataset = dataset
+
+        if cfg.sidecar_dir:
+            from lerobot.utils.record_sidecar import SessionSidecar
+
+            sidecar = SessionSidecar(
+                cfg.sidecar_dir,
+                fps=cfg.dataset.fps,
+                cameras=list(getattr(robot, "cameras", {}) or {}),
+                state_names=dataset.features.get(f"{OBS_STR}.state", {}).get("names"),
+                action_names=dataset.features.get(ACTION, {}).get("names"),
+                task=cfg.dataset.single_task or "",
+                dataset_root=str(dataset.root),
+                width=cfg.sidecar_width,
+            )
+        frame_hook = sidecar.add_frame if sidecar is not None else None
 
         # Connect the teleoperator before the robot so the robot isn't left idle (and possibly
         # tripping a firmware watchdog) during teleop init. Matches lerobot_teleoperate.py.
@@ -718,6 +805,8 @@ def _run_session(
                 if display is not None:
                     display.episode = recorded_episodes
                     display.set_state("RECORDING", f"episode {episode_index}")
+                if sidecar is not None:
+                    sidecar.start_episode(episode_index)
                 record_loop(
                     robot=robot,
                     events=events,
@@ -733,6 +822,7 @@ def _run_session(
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
                     display_hook=display_hook,
+                    frame_hook=frame_hook,
                     timer=timer,
                 )
 
@@ -767,6 +857,8 @@ def _run_session(
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    if sidecar is not None:
+                        sidecar.discard_episode()
                     timer.log_episode_summary("discarded episode")
                     timer.restart()
                     continue
@@ -774,6 +866,10 @@ def _run_session(
                 if display is not None:
                     display.set_state("SAVING", f"writing episode {episode_index}")
                 dataset.save_episode()
+                if sidecar is not None:
+                    # After the dataset, so a sidecar episode never exists without its
+                    # dataset counterpart.
+                    sidecar.save_episode()
                 recorded_episodes += 1
                 if display is not None:
                     display.saved_episodes = recorded_episodes
@@ -796,6 +892,10 @@ def _run_session(
         if display is not None:
             display.set_state("PARKING", "moving to the rest pose")
         _park_at_rest(robot, cfg)
+
+        if sidecar is not None:
+            # Drops an episode that was started but never saved (a crash mid-episode).
+            sidecar.close()
 
         if dataset:
             dataset.finalize()
@@ -868,10 +968,16 @@ def record(
         ),
         aggregate_pipeline_dataset_features(
             pipeline=robot_observation_processor,
-            initial_features=create_initial_features(observation=robot.observation_features),
+            initial_features=create_initial_features(
+                observation=dataset_observation_features(robot, cfg.dataset_cameras)
+            ),
             use_videos=cfg.dataset.video,
         ),
     )
+    cameras = list(getattr(robot, "cameras", {}) or {})
+    left_out = [c for c in cameras if cfg.dataset_cameras and c not in cfg.dataset_cameras]
+    if left_out:
+        logging.info(f"Cameras kept out of the dataset (window and sidecar only): {left_out}")
 
     display = None
     if use_window:

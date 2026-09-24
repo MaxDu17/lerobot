@@ -35,6 +35,10 @@ Extending it:
 * a new control -> add a button in :meth:`RecordWindow._build_controls`, which routes
   through the same ``on_command`` callback the keyboard uses.
 
+With ``--review_command`` set, a dockable "Review" panel adds a **Review last N** button:
+it runs that command in the background with :class:`QProcess` and renders its stdout as
+markdown, newest first. The record loop never waits on it (see :class:`ReviewDock`).
+
 Threading. Qt owns the main thread and the record loop runs on a worker, which is the
 inverse of the usual lerobot arrangement but the only way Qt works: widgets may only
 be touched from the thread that created them, and on macOS that has to be the main
@@ -53,16 +57,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QProcess, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QDockWidget,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
+    QSpinBox,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -284,14 +291,15 @@ def _numpy_to_pixmap(frame: np.ndarray, width: int) -> QPixmap:
 class CameraTile(QWidget):
     """One camera feed with a caption that doubles as its health readout."""
 
-    def __init__(self, name: str, width: int) -> None:
+    def __init__(self, name: str, width: int, note: str = "") -> None:
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self.name = name
-        self.caption = QLabel(name)
+        # e.g. "overhead  ·  not in dataset"
+        self.name = f"{name}  ·  {note}" if note else name
+        self.caption = QLabel(self.name)
         self.caption.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
 
         self.view = QLabel()
@@ -323,8 +331,157 @@ class CameraTile(QWidget):
         self.caption.setStyleSheet(f"color: {colour}; font-size: 11px;")
 
 
+@dataclass
+class ReviewSettings:
+    """What the "Review last N" button runs (``--review_command``).
+
+    ``{last}`` in *command* becomes the spin box value; every ``{key}`` in *substitutions*
+    is replaced too. Plain replacement rather than ``str.format``, so other braces in the
+    command survive.
+    """
+
+    command: str
+    default_last: int = 5
+    substitutions: dict[str, str] = field(default_factory=dict)
+
+    def render(self, last: int) -> str:
+        command = self.command.replace("{last}", str(last))
+        for key, value in self.substitutions.items():
+            command = command.replace("{" + key + "}", value)
+        return command
+
+
+class ReviewDock(QDockWidget):
+    """Button + spin box that run the review command, and its replies as markdown.
+
+    The command runs in a :class:`QProcess`, which is asynchronous and reports back on the
+    GUI thread, so neither the window nor the record loop waits on it. It runs under
+    ``nice`` because the review decodes video while recording continues, and the loop's
+    rate matters more. One review at a time; replies stack newest first.
+    """
+
+    def __init__(self, settings: ReviewSettings, parent: QWidget | None = None) -> None:
+        super().__init__("Review", parent)
+        self.settings = settings
+        self.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        self.setMinimumWidth(400)
+        self.setStyleSheet(
+            f"QDockWidget {{ color: {_DIM}; font-size: 11px; }}"
+            f"QDockWidget::title {{ background: {_BG}; padding: 6px 8px; }}"
+        )
+
+        body = QWidget()
+        body.setStyleSheet(f"background: {_BG}; color: {_TEXT};")
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        row = QHBoxLayout()
+        self.button = QPushButton("Review last")
+        self.button.setStyleSheet(
+            f"QPushButton {{ background: #32323a; color: {_TEXT}; border: none; padding: 7px 12px;"
+            f" border-radius: 4px; font-size: 12px; }}"
+            f"QPushButton:hover {{ background: #3e3e48; }}"
+            f"QPushButton:disabled {{ color: {_DIM}; }}"
+        )
+        self.button.setFocusPolicy(Qt.NoFocus)  # keep n/r/q going to the window
+        self.button.clicked.connect(self.start)
+        self.count = QSpinBox()
+        self.count.setRange(1, 100)
+        self.count.setValue(settings.default_last)
+        self.count.setSuffix(" demos")
+        self.count.setFocusPolicy(Qt.ClickFocus)
+        # hand the keyboard back once a number is entered, or n/r/q would land here
+        self.count.editingFinished.connect(lambda: self.parent() and self.parent().setFocus())
+        row.addWidget(self.button)
+        row.addWidget(self.count)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
+        layout.addWidget(self.status)
+
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        self.view.setFocusPolicy(Qt.NoFocus)
+        self.view.setStyleSheet(
+            f"QTextBrowser {{ background: {_PANEL}; color: {_TEXT}; border: none; border-radius: 6px;"
+            f" padding: 6px; font-size: 12px; }}"
+        )
+        self.view.setMarkdown("*No reviews yet.*")
+        layout.addWidget(self.view, 1)
+        self.setWidget(body)
+
+        self.entries: list[str] = []
+        self.process: QProcess | None = None
+        self._started = 0.0
+        self._last = 0
+        self._ticker = QTimer(self)
+        self._ticker.timeout.connect(self._tick)
+
+    def start(self) -> None:
+        if self.process is not None:
+            return
+        if self.parent() is not None:  # the spin box may still hold the keyboard
+            self.parent().setFocus()
+        self._last = self.count.value()
+        command = self.settings.render(self._last)
+        logger.info("Review: %s", command)
+        self.process = QProcess(self)
+        self.process.finished.connect(self._finished)
+        self.process.errorOccurred.connect(self._error)
+        self._started = time.perf_counter()
+        self.button.setEnabled(False)
+        self._tick()
+        self._ticker.start(1000)
+        self.process.start("nice", ["-n", "10", "/bin/sh", "-c", command])
+
+    def _tick(self) -> None:
+        elapsed = time.perf_counter() - self._started
+        self.status.setText(f"reviewing the last {self._last} demos… {elapsed:.0f} s")
+
+    def _done(self) -> tuple[str, str, float]:
+        out = bytes(self.process.readAllStandardOutput()).decode(errors="replace").strip()
+        err = bytes(self.process.readAllStandardError()).decode(errors="replace").strip()
+        self._ticker.stop()
+        self.process.deleteLater()
+        self.process = None
+        self.button.setEnabled(True)
+        return out, err, time.perf_counter() - self._started
+
+    def _finished(self, exit_code: int, _status) -> None:
+        if self.process is None:  # already handled by _error
+            return
+        out, err, took = self._done()
+        header = f"### {time.strftime('%H:%M')} · last {self._last} demos · {took:.0f} s"
+        if exit_code == 0 and out:
+            self.entries.insert(0, f"{header}\n\n{out}")
+            self.status.setText(f"done in {took:.0f} s")
+        else:
+            tail = "\n".join(err.splitlines()[-15:]) or "(no output)"
+            self.entries.insert(0, f"{header}\n\n**Review failed** (exit {exit_code})\n\n```\n{tail}\n```")
+            self.status.setText(f"failed after {took:.0f} s")
+            logger.warning("Review command failed (exit %s): %s", exit_code, tail)
+        self.view.setMarkdown("\n\n---\n\n".join(self.entries))
+
+    def _error(self, error) -> None:
+        # FailedToStart never emits `finished`; the other errors are followed by it.
+        if error != QProcess.FailedToStart or self.process is None:
+            return
+        self._done()
+        self.status.setText("review command could not start (is `nice` / `sh` on PATH?)")
+
+    def shutdown(self) -> None:
+        """Stop a review still running when the window closes."""
+        if self.process is not None:
+            self.process.kill()
+            self.process.waitForFinished(2000)
+
+
 class RecordWindow(QMainWindow):
-    """Camera tiles on the left, status panel and controls on the right."""
+    """Camera tiles on the left, status panel and controls on the right, and the review
+    panel docked beside them when a review command is configured."""
 
     def __init__(
         self,
@@ -332,6 +489,8 @@ class RecordWindow(QMainWindow):
         on_command: Callable[[str], None],
         tile_width: int = 480,
         columns: int = 2,
+        camera_notes: dict[str, str] | None = None,
+        review: ReviewSettings | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("LeRobot recording")
@@ -350,7 +509,7 @@ class RecordWindow(QMainWindow):
         grid.setSpacing(10)
         self.tiles: dict[str, CameraTile] = {}
         for i, name in enumerate(camera_names):
-            tile = CameraTile(name, tile_width)
+            tile = CameraTile(name, tile_width, (camera_notes or {}).get(name, ""))
             self.tiles[name] = tile
             # Top-aligned, otherwise the grid spreads each tile over the full row
             # height and the caption ends up floating far above its image.
@@ -363,6 +522,11 @@ class RecordWindow(QMainWindow):
         root.addLayout(grid)
         root.addWidget(self._build_panel())
         self.setCentralWidget(central)
+
+        self.review_dock = None
+        if review is not None:
+            self.review_dock = ReviewDock(review, self)
+            self.addDockWidget(Qt.RightDockWidgetArea, self.review_dock)
 
         # Keystrokes must reach keyPressEvent even when a button has been clicked,
         # which would otherwise take focus and swallow them.
@@ -488,6 +652,8 @@ class RecordWindow(QMainWindow):
         # Closing the window ends the session. The episode in progress is still saved
         # and the arm still parks, because this takes the same path as 'q'.
         self._dispatch("quit")
+        if self.review_dock is not None:
+            self.review_dock.shutdown()
         super().closeEvent(event)
 
     def on_update(self, frames: dict[str, np.ndarray], status: RecordStatus) -> None:
