@@ -55,6 +55,7 @@ reviewer reading the sidecar -- and shows its stdout as markdown.
 
 ``--wait_for_start=true`` holds the first episode until ``n`` is pressed, instead of recording
 the moment the robot connects; the arm can be teleoperated, unrecorded, until then.
+``--dataset.reset_time_s=inf`` does the same for every reset: the next episode starts on ``n`` only.
 
 Pass ``--rest_pose="{shoulder_pan.pos: 0.0, ...}"`` to park the arm before disconnecting, on every
 exit path.  Disconnecting cuts torque, so without it the arm drops when the session ends -- after
@@ -109,8 +110,11 @@ lerobot-record \\
 ```
 """
 
+import json
 import logging
+import shutil
 import signal
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -178,7 +182,8 @@ from lerobot.teleoperators import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.teleoperators.keyboard import KeyboardTeleop
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.datasets.utils import INFO_PATH
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins, require_package
@@ -245,6 +250,9 @@ class RecordConfig:
     # and the window is for watching the scene, not for measuring it.
     display_fps: float = 15.0
     display_tile_width: int = 480
+    # Camera tiles per row. One stacks them, which keeps the window narrow enough to leave
+    # room for the review panel beside it.
+    display_columns: int = 1
     # Shell command behind the window's "Review last N" button, run in the background
     # (at low priority, so the loop keeps its rate). Its stdout is shown in the window as
     # markdown. {last}, {sidecar_dir} and {dataset_root} are substituted. Unset: no button.
@@ -276,6 +284,12 @@ class RecordConfig:
     # Seconds to interpolate the park over. The move is a straight line in joint space
     # with no collision checking, so keep this slow enough to reach the power switch.
     move_duration_s: float = 3.0
+    # Seconds to ease the follower onto the leader when the session starts. Without it the
+    # first command is the leader's pose, wherever the follower is, and the motors close
+    # that gap at full speed. The command blends from the follower's pose to the leader's
+    # *live* pose, so the leader may move meanwhile. Nothing is recorded; 'n' and 'r' are
+    # ignored until it finishes, 'q' still ends the session. 0 disables it.
+    ease_in_s: float = 0.0
 
     def __post_init__(self):
         if self.teleop is None:
@@ -336,6 +350,7 @@ def record_loop(
     display_hook: Callable[[RobotObservation, bool], None] | None = None,
     frame_hook: Callable[[dict, RobotObservation], None] | None = None,
     timer: CycleTimer | None = None,
+    action_filter: Callable[[RobotAction, RobotObservation], RobotAction] | None = None,
 ):
     """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
 
@@ -354,6 +369,10 @@ def record_loop(
     statistics span the whole session and are reported per episode.  Without it each
     call gets a private timer: identical pacing and identical slow-loop warnings, just
     no end-of-run summary, since a single phase has no run to summarise.
+
+    *action_filter* rewrites each command, given the raw observation, just before it is
+    sent (:class:`EaseIn` uses it).  A dataset still records the teleop action, so it is
+    meant for unrecorded phases.
     """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -454,6 +473,9 @@ def record_loop(
             timestamp = time.perf_counter() - start_episode_t
             continue
 
+        if action_filter is not None:
+            robot_action_to_send = action_filter(robot_action_to_send, obs)
+
         with timer.section("send"):
             # Send action to robot
             # Action can eventually be clipped using `max_relative_target`,
@@ -482,6 +504,40 @@ def record_loop(
         timer.wait()
 
         timestamp = time.perf_counter() - start_episode_t
+
+
+class EaseIn:
+    """An ``action_filter`` that eases the follower onto the leader over *duration_s*.
+
+    The command is ``(1 - a) * start + a * leader``, where *start* is the follower's pose
+    at the first tick and *a* rises from 0 to 1 along a smoothstep, which has zero slope
+    at both ends: no jolt as the move begins, and no step when plain teleop takes over.
+    Blending towards the leader's live pose, rather than moving to a snapshot of it the
+    way :func:`follower_smooth_move_to` does, is what lets the operator hold the leader
+    naturally meanwhile. Keys the observation lacks pass through unchanged.
+
+    The clock starts at the first command, and only then, so a phase that is cut short
+    and resumed carries on where it left off.
+    """
+
+    def __init__(self, duration_s: float):
+        self.duration_s = duration_s
+        self._start: dict[str, float] | None = None
+        self._t0 = 0.0
+
+    @property
+    def remaining_s(self) -> float:
+        if self._start is None:
+            return self.duration_s
+        return max(self.duration_s - (time.perf_counter() - self._t0), 0.0)
+
+    def __call__(self, action: RobotAction, observation: RobotObservation) -> RobotAction:
+        if self._start is None:
+            self._t0 = time.perf_counter()
+            self._start = {k: float(observation[k]) for k in action if k in observation}
+        s = 1.0 - self.remaining_s / self.duration_s if self.duration_s > 0 else 1.0
+        a = s * s * (3.0 - 2.0 * s)
+        return {k: (1.0 - a) * self._start[k] + a * v if k in self._start else v for k, v in action.items()}
 
 
 class _RecordDisplay:
@@ -547,6 +603,7 @@ class _RecordDisplay:
             camera_names=self.camera_names,
             on_command=self.dispatch,
             tile_width=cfg.display_tile_width,
+            columns=cfg.display_columns,
             camera_notes=notes,
             review=review,
         )
@@ -694,6 +751,65 @@ def _park_at_rest(robot: Robot, cfg: RecordConfig) -> None:
         logging.exception("Failed to park at the rest pose; disconnecting anyway.")
 
 
+def _confirm_overwrite(cfg: RecordConfig) -> None:
+    """Offer to delete the dataset already at ``--dataset.root`` when not resuming.
+
+    ``LeRobotDataset.create`` refuses a root that exists, which used to end the session in
+    a FileExistsError. This asks on the terminal instead, before anything connects and
+    before the key listener takes the TTY over; 'n' exits without touching anything. The
+    sidecar goes too on 'y', since it would otherwise mix the old episodes into the new
+    ones under the same numbers, and carry on the old session's review chat.
+
+    Only a folder that is a LeRobot dataset (or empty) is offered: anything else at that
+    path is left for the original error rather than deleted on a 'y'. With no terminal
+    to ask on, nothing changes either.
+    """
+    if cfg.resume:
+        return
+    if cfg.dataset.root is not None:
+        root = Path(cfg.dataset.root)
+    elif cfg.dataset.no_stamp:
+        root = HF_LEROBOT_HOME / cfg.dataset.repo_id
+    else:
+        return  # the name gets a timestamp at creation, so it cannot collide
+    is_dataset = (root / INFO_PATH).is_file()
+    is_empty = root.is_dir() and not any(root.iterdir())
+    if not (is_dataset or is_empty) or not sys.stdin.isatty():
+        return
+
+    episodes = "empty"
+    if is_dataset:
+        try:
+            count = json.loads((root / INFO_PATH).read_text())["total_episodes"]
+            episodes = f"{count} episode{'' if count == 1 else 's'}"
+        except (OSError, ValueError, KeyError):
+            episodes = "episode count unreadable"
+    sidecar = Path(cfg.sidecar_dir) if cfg.sidecar_dir else None
+    print(f"\n  dataset: {root.resolve()}  ({episodes})")
+    if sidecar is not None and sidecar.exists():
+        print(f"  sidecar: {sidecar.resolve()}  (deleted with it)")
+    while True:
+        try:
+            answer = input(
+                f"Existing dataset found and --resume is not set. Do you want to overwrite {root.name} y/n? "
+            )
+        except EOFError:
+            answer = "n"
+        answer = answer.strip().lower()
+        if answer in ("y", "yes"):
+            break
+        if answer in ("n", "no"):
+            sys.exit(
+                f"Not overwriting {root.name}. Add --resume=true to keep recording into it, "
+                "or choose another --dataset.root."
+            )
+
+    shutil.rmtree(root)
+    if sidecar is not None and sidecar.exists():
+        shutil.rmtree(sidecar)
+    logging.info("Deleted %s to record it afresh.", root)
+
+
 def _run_session(
     cfg: RecordConfig,
     robot: Robot,
@@ -805,8 +921,8 @@ def _run_session(
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.rgb_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
-        def teleoperate(control_time_s: float) -> None:
-            """Drive the arm without recording: the resets, and the wait for the first 'n'."""
+        def teleoperate(control_time_s: float, action_filter=None) -> None:
+            """Drive the arm without recording: the ease-in, the wait for the first 'n', and the resets."""
             record_loop(
                 robot=robot,
                 events=events,
@@ -820,9 +936,20 @@ def _run_session(
                 display_data=log_to_visualizer,
                 display_mode=cfg.display_mode,
                 display_hook=display_hook,
+                action_filter=action_filter,
             )
 
         with VideoEncodingManager(dataset):
+            if cfg.ease_in_s > 0:
+                logging.info("Easing the follower onto the leader over %.1fs...", cfg.ease_in_s)
+                if display is not None:
+                    display.set_state("SYNCING", "easing the follower onto the leader")
+                ease = EaseIn(cfg.ease_in_s)
+                # 'n' and 'r' end a phase, but cutting this one short would bring the jump back
+                while ease.remaining_s > 0 and not events["stop_recording"]:
+                    teleoperate(ease.remaining_s, action_filter=ease)
+                    events["rerecord_episode"] = False
+
             if cfg.wait_for_start and (listener is not None or display is not None):
                 log_say("Ready to record", cfg.play_sounds)
                 logging.info("Press 'n' to start recording episode %d.", dataset.num_episodes)
@@ -871,7 +998,23 @@ def _run_session(
                     log_say("Reset the environment", cfg.play_sounds)
                     if display is not None:
                         display.set_state("RESET", "reset the scene, then Start demo collection (n)")
-                    teleoperate(cfg.dataset.reset_time_s)
+                    # 'r' while recording has already asked for a discard. 'r' during the reset
+                    # asks for one too, but must not end the reset as it used to: the next demo
+                    # starts on 'n' (or the reset timer) only.
+                    discard = events["rerecord_episode"]
+                    events["rerecord_episode"] = False
+                    while True:
+                        teleoperate(cfg.dataset.reset_time_s)
+                        if not events["rerecord_episode"] or events["stop_recording"]:
+                            break
+                        discard = True
+                        events["rerecord_episode"] = False
+                        logging.info("Discarding the last episode; still resetting.")
+                        if display is not None:
+                            display.set_state(
+                                "RESET", "demo discarded; reset the scene, then Start demo collection (n)"
+                            )
+                    events["rerecord_episode"] = discard
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
@@ -956,6 +1099,7 @@ def record(
 ) -> LeRobotDataset:
     init_logging()
     logging.info(pformat(asdict(cfg)))
+    _confirm_overwrite(cfg)
     use_window = cfg.display_data and cfg.display_mode == PYQT_DISPLAY_MODE
     if cfg.display_data and not use_window:
         init_visualization(
