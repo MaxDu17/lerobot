@@ -53,6 +53,9 @@ while the session is still running (``lerobot.utils.record_sidecar``). ``--revie
 a "Review last N" button to the pyqt window that runs a command in the background -- typically a
 reviewer reading the sidecar -- and shows its stdout as markdown.
 
+``--wait_for_start=true`` holds the first episode until ``n`` is pressed, instead of recording
+the moment the robot connects; the arm can be teleoperated, unrecorded, until then.
+
 Pass ``--rest_pose="{shoulder_pan.pos: 0.0, ...}"`` to park the arm before disconnecting, on every
 exit path.  Disconnecting cuts torque, so without it the arm drops when the session ends -- after
 the last episode, on ``q``, and on Ctrl+C alike.  Capture a pose with ``tools/capture_pose.py``;
@@ -231,6 +234,11 @@ class RecordConfig:
     #               integrated terminal), which is why it is not the default here.
     # Matches `RobotClientConfig.keyboard_backend`, which defaults the same way.
     keyboard_backend: str = "terminal"
+    # Hold the first episode until 'n' (the window's "Start demo collection") instead of
+    # recording the moment the robot connects. The arm is teleoperated meanwhile and
+    # nothing is recorded; 'r' does nothing yet and 'q' ends the session. Ignored with
+    # neither a key listener nor a window, since nothing could then start the recording.
+    wait_for_start: bool = False
 
     # --- pyqt window (display_mode="pyqt") -------------------------------------------
     # Deliberately below the control rate: redrawing at 30 Hz costs more than it shows,
@@ -797,7 +805,36 @@ def _run_session(
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.rgb_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
+        def teleoperate(control_time_s: float) -> None:
+            """Drive the arm without recording: the resets, and the wait for the first 'n'."""
+            record_loop(
+                robot=robot,
+                events=events,
+                fps=cfg.dataset.fps,
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+                teleop=teleop,
+                control_time_s=control_time_s,
+                single_task=cfg.dataset.single_task,
+                display_data=log_to_visualizer,
+                display_mode=cfg.display_mode,
+                display_hook=display_hook,
+            )
+
         with VideoEncodingManager(dataset):
+            if cfg.wait_for_start and (listener is not None or display is not None):
+                log_say("Ready to record", cfg.play_sounds)
+                logging.info("Press 'n' to start recording episode %d.", dataset.num_episodes)
+                if display is not None:
+                    display.set_state("READY", "set up the scene, then Start demo collection (n)")
+                while not events["stop_recording"]:
+                    teleoperate(float("inf"))
+                    # 'r' ends the phase too, but there is nothing to re-record yet.
+                    if not events["rerecord_episode"]:
+                        break
+                    events["rerecord_episode"] = False
+
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 episode_index = dataset.num_episodes
@@ -833,22 +870,8 @@ def _run_session(
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
                     if display is not None:
-                        display.set_state("RESET", "reset the scene, then Keep + next")
-
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=log_to_visualizer,
-                        display_mode=cfg.display_mode,
-                        display_hook=display_hook,
-                    )
+                        display.set_state("RESET", "reset the scene, then Start demo collection (n)")
+                    teleoperate(cfg.dataset.reset_time_s)
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)

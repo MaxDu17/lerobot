@@ -38,6 +38,7 @@ Extending it:
 With ``--review_command`` set, a dockable "Review" panel adds a **Review last N** button:
 it runs that command in the background with :class:`QProcess` and renders its stdout as
 markdown, newest first. The record loop never waits on it (see :class:`ReviewDock`).
+**Read out feedback** reads the opening of each new reply aloud, and A−/A+ resize the text.
 
 Threading. Qt owns the main thread and the record loop runs on a worker, which is the
 inverse of the usual lerobot arrangement but the only way Qt works: widgets may only
@@ -51,16 +52,29 @@ arrays, which satisfies that.
 from __future__ import annotations
 
 import logging
+import platform
+import shutil
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
-from PyQt5.QtCore import QObject, QProcess, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QImage, QPixmap
+from PyQt5.QtCore import QObject, QPoint, QProcess, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QImage,
+    QPixmap,
+    QTextCursor,
+    QTextDocument,
+    QTextFormat,
+    QTextOption,
+)
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDockWidget,
     QFrame,
     QGridLayout,
@@ -132,12 +146,15 @@ PANEL_ROWS: list[tuple[str, Callable[[RecordStatus], str]]] = [
     ("Loop Hz", lambda s: f"{s.fps:.1f} / {s.target_fps:.0f}"),
 ]
 
-# Buttons rendered under the panel, as (label, command). Commands are the same strings
-# the keyboard produces, so both paths converge on one handler.
-CONTROL_BUTTONS: list[tuple[str, str]] = [
-    ("Keep + next  (n)", "next"),
-    ("Re-record  (r)", "rerecord"),
-    ("Stop recording  (q)", "quit"),
+# Buttons rendered under the panel, as (label, label while recording, command). Commands
+# are the same strings the keyboard produces, so both paths converge on one handler.
+# 'n' ends whichever phase is running, hence its two labels: from a reset it starts the
+# next demo, and while recording it ends the demo and keeps it. (The demo is written
+# after the reset that follows, so 'r' during that reset can still throw it away.)
+CONTROL_BUTTONS: list[tuple[str, str, str]] = [
+    ("Start demo collection  (n)", "Save demo  (n)", "next"),
+    ("Re-record  (r)", "Re-record  (r)", "rerecord"),
+    ("Stop recording  (q)", "Stop recording  (q)", "quit"),
 ]
 
 # The arrow/Esc spellings are accepted too, so the window and the TTY listener take the
@@ -351,6 +368,74 @@ class ReviewSettings:
         return command
 
 
+# Text size of the review replies, in points, and how far A−/A+ may take it. Points, not
+# pixels: Qt's markdown importer spaces paragraphs by the font's *point* size, which a
+# pixel-sized font reports as -1, and every paragraph gap then collapses to nothing.
+REVIEW_FONT_PT = 12
+REVIEW_FONT_RANGE = (8, 32)
+REVIEW_FONT_STEP = 2
+
+
+def _speech_command() -> list[str] | None:
+    """The text-to-speech program :func:`lerobot.utils.utils.say` uses here, if installed.
+
+    Run as a QProcess rather than through ``say()`` itself, so that a newer review, or
+    unticking the box, can cut off a reading still in progress.
+    """
+    command = {"Darwin": ["say"], "Linux": ["spd-say", "--wait"]}.get(platform.system())
+    return command if command and shutil.which(command[0]) else None
+
+
+def spoken_summary(markdown: str, min_chars: int = 30) -> str:
+    """The opening of a review reply as plain text, for reading aloud.
+
+    That is the first paragraph, which the review-demos skill makes its verdict, plus the
+    ones after it while the text is still under *min_chars* (a bare "Verdict: ok" says
+    little). Headings, tables and code blocks are skipped: a table read out is noise.
+    Parsed with Qt's own markdown importer, so it finds the same paragraphs the view
+    shows, with the markup already gone. Needs a QApplication.
+    """
+    document = QTextDocument()
+    document.setMarkdown(markdown)
+    spoken: list[str] = []
+    block = document.begin()
+    while block.isValid() and len(" ".join(spoken)) < min_chars:
+        # U+2028 is how the importer stores a hard line break
+        text = block.text().replace("\u2028", " ").strip()
+        prose = (
+            block.blockFormat().headingLevel() == 0
+            and not block.blockFormat().hasProperty(QTextFormat.BlockCodeFence)
+            and QTextCursor(block).currentTable() is None
+        )
+        if text and prose:
+            spoken.append(text)
+        block = block.next()
+    return " ".join(spoken)
+
+
+def _tidy_tables(document: QTextDocument) -> None:
+    """Draw markdown tables with one thin rule between cells, in the panel's colours.
+
+    Qt's default boxes every cell separately, so each border is drawn twice, in a grey
+    that glares on the dark panel.
+    """
+    tables = []
+    block = document.begin()
+    while block.isValid():
+        table = QTextCursor(block).currentTable()
+        if table is not None and table not in tables:
+            tables.append(table)
+        block = block.next()
+    for table in tables:
+        fmt = table.format()
+        fmt.setBorderCollapse(True)
+        fmt.setBorder(1)
+        fmt.setBorderBrush(QBrush(QColor("#4a4a52")))
+        fmt.setCellSpacing(0)
+        fmt.setCellPadding(4)
+        table.setFormat(fmt)
+
+
 class ReviewDock(QDockWidget):
     """Button + spin box that run the review command, and its replies as markdown.
 
@@ -358,6 +443,10 @@ class ReviewDock(QDockWidget):
     GUI thread, so neither the window nor the record loop waits on it. It runs under
     ``nice`` because the review decodes video while recording continues, and the loop's
     rate matters more. One review at a time; replies stack newest first.
+
+    With **Read out feedback** ticked, each new reply's opening (:func:`spoken_summary`)
+    is read aloud, so the operator can hear the verdict without looking away from the
+    arm. A−/A+ change the size of the replies' text.
     """
 
     def __init__(self, settings: ReviewSettings, parent: QWidget | None = None) -> None:
@@ -376,14 +465,15 @@ class ReviewDock(QDockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        row = QHBoxLayout()
-        self.button = QPushButton("Review last")
-        self.button.setStyleSheet(
+        button_style = (
             f"QPushButton {{ background: #32323a; color: {_TEXT}; border: none; padding: 7px 12px;"
             f" border-radius: 4px; font-size: 12px; }}"
             f"QPushButton:hover {{ background: #3e3e48; }}"
             f"QPushButton:disabled {{ color: {_DIM}; }}"
         )
+        row = QHBoxLayout()
+        self.button = QPushButton("Review last")
+        self.button.setStyleSheet(button_style)
         self.button.setFocusPolicy(Qt.NoFocus)  # keep n/r/q going to the window
         self.button.clicked.connect(self.start)
         self.count = QSpinBox()
@@ -396,29 +486,82 @@ class ReviewDock(QDockWidget):
         row.addWidget(self.button)
         row.addWidget(self.count)
         row.addStretch(1)
+        self.read_aloud = QCheckBox("Read out feedback")
+        self.read_aloud.setStyleSheet("font-size: 12px;")
+        self.read_aloud.setFocusPolicy(Qt.NoFocus)  # Space would toggle it, and n/r/q stop
+        self._speech_command = _speech_command()
+        if self._speech_command is None:
+            self.read_aloud.setEnabled(False)
+            self.read_aloud.setToolTip("No text-to-speech program (say / spd-say) found.")
+        else:
+            self.read_aloud.setToolTip("Read the start of each new review aloud.")
+        self.read_aloud.toggled.connect(lambda on: on or self._stop_speaking())
+        row.addWidget(self.read_aloud)
         layout.addLayout(row)
 
+        status_row = QHBoxLayout()
         self.status = QLabel("")
         self.status.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
-        layout.addWidget(self.status)
+        status_row.addWidget(self.status, 1)
+        # Next to the text they resize, rather than up with the review controls.
+        self.smaller = QPushButton("A−")
+        self.larger = QPushButton("A+")
+        for button, step, tip in ((self.smaller, -1, "Smaller text"), (self.larger, 1, "Larger text")):
+            button.setStyleSheet(button_style)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setToolTip(tip)
+            button.clicked.connect(lambda _, s=step: self.set_font_size(self._font_pt + s * REVIEW_FONT_STEP))
+            status_row.addWidget(button)
+        layout.addLayout(status_row)
 
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
         self.view.setFocusPolicy(Qt.NoFocus)
-        self.view.setStyleSheet(
-            f"QTextBrowser {{ background: {_PANEL}; color: {_TEXT}; border: none; border-radius: 6px;"
-            f" padding: 6px; font-size: 12px; }}"
-        )
-        self.view.setMarkdown("*No reviews yet.*")
+        # A long unbreakable table cell (an episode list like "0,2,13,14,17,20,24") would
+        # otherwise widen the table past the panel, and every paragraph with it, which then
+        # runs off the right edge. This breaks such a word instead, and only such a word.
+        self.view.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
         layout.addWidget(self.view, 1)
         self.setWidget(body)
 
         self.entries: list[str] = []
         self.process: QProcess | None = None
+        self.speech = QProcess(self)
         self._started = 0.0
         self._last = 0
         self._ticker = QTimer(self)
         self._ticker.timeout.connect(self._tick)
+        self._font_pt = REVIEW_FONT_PT
+        self.set_font_size(REVIEW_FONT_PT)  # also renders the "no reviews yet" placeholder
+
+    def set_font_size(self, pt: int) -> None:
+        """Resize the replies' text, within REVIEW_FONT_RANGE, keeping the scroll position."""
+        low, high = REVIEW_FONT_RANGE
+        self._font_pt = min(max(pt, low), high)
+        self.smaller.setEnabled(self._font_pt > low)
+        self.larger.setEnabled(self._font_pt < high)
+        self.view.setStyleSheet(
+            f"QTextBrowser {{ background: {_PANEL}; color: {_TEXT}; border: none; border-radius: 6px;"
+            f" padding: 6px; font-size: {self._font_pt}pt; }}"
+        )
+        self._render(keep_scroll=True)
+
+    def _render(self, keep_scroll: bool = False) -> None:
+        """Rebuild the view from `entries`.
+
+        Also needed after a font change, not just a new reply: the importer bakes the size
+        at the time into code spans and paragraph gaps, which would not follow otherwise.
+        """
+        # Anchored to the paragraph at the top rather than to a scroll fraction: the text
+        # reflows at a new size, and Qt lays it out lazily, so a fraction lands elsewhere.
+        anchor = self.view.cursorForPosition(QPoint(0, 0)).position()
+        self.view.setMarkdown("\n\n---\n\n".join(self.entries) or "*No reviews yet.*")
+        document = self.view.document()
+        _tidy_tables(document)
+        if keep_scroll:
+            # blockBoundingRect lays the document out up to the block, so this is exact
+            top = document.documentLayout().blockBoundingRect(document.findBlock(anchor)).top()
+            self.view.verticalScrollBar().setValue(int(top))
 
     def start(self) -> None:
         if self.process is not None:
@@ -458,12 +601,14 @@ class ReviewDock(QDockWidget):
         if exit_code == 0 and out:
             self.entries.insert(0, f"{header}\n\n{out}")
             self.status.setText(f"done in {took:.0f} s")
+            self._speak(spoken_summary(out))
         else:
             tail = "\n".join(err.splitlines()[-15:]) or "(no output)"
             self.entries.insert(0, f"{header}\n\n**Review failed** (exit {exit_code})\n\n```\n{tail}\n```")
             self.status.setText(f"failed after {took:.0f} s")
             logger.warning("Review command failed (exit %s): %s", exit_code, tail)
-        self.view.setMarkdown("\n\n---\n\n".join(self.entries))
+            self._speak("Review failed.")
+        self._render()
 
     def _error(self, error) -> None:
         # FailedToStart never emits `finished`; the other errors are followed by it.
@@ -471,9 +616,24 @@ class ReviewDock(QDockWidget):
             return
         self._done()
         self.status.setText("review command could not start (is `nice` / `sh` on PATH?)")
+        self._speak("Review could not start.")
+
+    def _speak(self, text: str) -> None:
+        """Read *text* aloud if the box is ticked, cutting off any earlier reading."""
+        if not text or not self.read_aloud.isChecked():
+            return
+        self._stop_speaking()
+        # "--" so a reply that opens with a dash is read, not parsed as an option
+        self.speech.start(self._speech_command[0], [*self._speech_command[1:], "--", text])
+
+    def _stop_speaking(self) -> None:
+        if self.speech.state() != QProcess.NotRunning:
+            self.speech.kill()
+            self.speech.waitForFinished(1000)
 
     def shutdown(self) -> None:
-        """Stop a review still running when the window closes."""
+        """Stop a review, or a reading, still running when the window closes."""
+        self._stop_speaking()
         if self.process is not None:
             self.process.kill()
             self.process.waitForFinished(2000)
@@ -612,8 +772,11 @@ class RecordWindow(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        for label, command in CONTROL_BUTTONS:
+        # (button, label, label while recording), relabelled by on_update
+        self._control_buttons: list[tuple[QPushButton, str, str]] = []
+        for label, recording_label, command in CONTROL_BUTTONS:
             button = QPushButton(label)
+            self._control_buttons.append((button, label, recording_label))
             button.setStyleSheet(
                 f"QPushButton {{ background: #32323a; color: {_TEXT}; border: none;"
                 f" padding: 7px; border-radius: 4px; font-size: 12px; }}"
@@ -670,6 +833,8 @@ class RecordWindow(QMainWindow):
         self.root_label.setText(status.dataset_root)
         self.message_label.setText(status.message)
         self.message_label.setStyleSheet(f"color: {colour}; font-size: 11px;")
+        for button, label, recording_label in self._control_buttons:
+            button.setText(recording_label if status.recording else label)
 
         # Cap the banner: past the first few, the list stops being readable at a glance
         # and the point is to be noticed, not to be complete. The log has them all.

@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import re
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -29,6 +29,7 @@ from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
 from lerobot.scripts.lerobot_record import RecordConfig, record, record_loop
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.utils.keyboard_input import apply_recording_control
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
@@ -187,6 +188,55 @@ def test_record_reports_a_cadence_summary_per_episode_and_for_the_run(tmp_path, 
     # fps but records nothing, so it runs on its own timer rather than diluting the
     # numbers that answer "did I record at `fps`?".
     assert _step_calls(run, "record") == _step_calls(run, "observe") == _ticks(run)
+
+
+@pytest.mark.parametrize(
+    "keys, phases, episodes",
+    [
+        # 'r' has nothing to re-record yet, so the wait goes on until 'n'
+        (["left", "right"], ["wait", "wait", "episode"], 1),
+        # 'q' ends the session before anything is recorded
+        (["esc"], ["wait"], 0),
+    ],
+)
+def test_record_waits_for_n_before_the_first_episode(tmp_path, keys, phases, episodes):
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            root=tmp_path / "wait",
+            num_episodes=1,
+            episode_time_s=0.1,
+            reset_time_s=0,
+            push_to_hub=False,
+        ),
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+        wait_for_start=True,
+    )
+    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
+    seen = []
+
+    def loop_pressing_keys(**kwargs):
+        if kwargs.get("dataset") is not None:
+            seen.append("episode")
+        elif kwargs["control_time_s"] == float("inf"):
+            seen.append("wait")
+            # one key per wait phase; running out raises instead of waiting forever
+            apply_recording_control(keys[len(seen) - 1], events)
+        else:
+            seen.append("reset")
+        return record_loop(**kwargs)
+
+    with (
+        patch("lerobot.scripts.lerobot_record.init_keyboard_listener", return_value=(MagicMock(), events)),
+        patch("lerobot.scripts.lerobot_record.record_loop", side_effect=loop_pressing_keys),
+    ):
+        dataset = record(cfg)
+
+    assert seen == phases
+    assert dataset.num_episodes == episodes
 
 
 def test_record_loop_without_a_teleoperator_paces_and_terminates():
