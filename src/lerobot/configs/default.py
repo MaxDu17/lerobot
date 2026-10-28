@@ -55,6 +55,11 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # Seed for the random choice of held-out episodes. Deliberately separate from the training
+    # `seed` so a seed sweep re-inits the model without also moving the eval set underneath it;
+    # keep it fixed to compare runs, and keep it fixed across a resume or eval episodes leak
+    # into training.
+    eval_split_seed: int = 42
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):

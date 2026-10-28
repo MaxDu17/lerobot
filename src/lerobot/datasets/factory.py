@@ -15,6 +15,7 @@
 # limitations under the License.
 import logging
 import math
+import random
 from pprint import pformat
 
 import torch
@@ -200,8 +201,11 @@ def make_train_eval_datasets(
 ) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
-    The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
-    If eval_split == 0.0, returns (full_dataset, None).
+    ceil(n_episodes * eval_split) episodes per task are drawn at random for evaluation, seeded by
+    `dataset.eval_split_seed` so the split is reproducible across runs and resumes. Sampling at
+    random rather than taking the last episodes matters for datasets merged from several recording
+    sessions, where a trailing slice would be drawn entirely from the session that happens to sort
+    last. If eval_split == 0.0, returns (full_dataset, None).
     """
     full_dataset = make_dataset(cfg)
 
@@ -218,20 +222,30 @@ def make_train_eval_datasets(
         task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
         task_to_episodes.setdefault(task_key, []).append(ep_idx)
 
+    rng = random.Random(cfg.dataset.eval_split_seed)
     train_episodes, eval_episodes = [], []
-    for eps in task_to_episodes.values():
+    # Tasks in sorted order so the draw depends only on the seed, not on the order tasks
+    # happen to first appear in the dataset.
+    for task_key in sorted(task_to_episodes):
+        eps = task_to_episodes[task_key]
         n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
-        train_episodes.extend(eps[: len(eps) - n_eval])
-        eval_episodes.extend(eps[len(eps) - n_eval :])
+        shuffled = rng.sample(eps, len(eps))
+        eval_episodes.extend(shuffled[:n_eval])
+        train_episodes.extend(shuffled[n_eval:])
+    train_episodes.sort()
+    eval_episodes.sort()
 
     if not train_episodes:
         raise ValueError(
             f"eval_split={cfg.dataset.eval_split} leaves 0 training episodes from {len(base_episodes)} total."
         )
 
+    # The held-out episodes are no longer a predictable trailing slice, so log them.
+    shown = eval_episodes if len(eval_episodes) <= 20 else eval_episodes[:20] + ["..."]
     logging.info(
         f"Train/eval split: {len(train_episodes)} train, {len(eval_episodes)} eval "
-        f"(eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks)"
+        f"(eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks, "
+        f"eval_split_seed={cfg.dataset.eval_split_seed}); eval episodes: {shown}"
     )
 
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta, cfg.rename_map)
